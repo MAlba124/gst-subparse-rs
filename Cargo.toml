@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/subparse-formats", "crates/gst-subparse"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+authors = ["Marcus Hanestad <marlhan@proton.me>"]
+repository = "https://github.com/MAlba124/gst-subparse-rs"

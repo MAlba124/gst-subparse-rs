@@ -1,0 +1,110 @@
+[package]
+name = "subparse-formats"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+authors = ["Marcus Hanestad <marlhan@proton.me>"]
+description = "Dependency-free subtitle format parsers (SubRip, WebVTT, SSA/ASS, MicroDVD, SAMI, MPL2, SubViewer, TMPlayer, MPSub, QTtext, LRC, DKS)"
+
+# INTENTIONALLY EMPTY. This crate MUST remain dependency-free (std only).
+# Do not add crates here, not even for parsing, regex, or benchmarking.
+[dependencies]
+
+[dev-dependencies]
+# Also empty on purpose, unit tests and benches use std only.
+
+# One feature per subtitle format. Each gates that format's parser module, its
+# `Format` variant, and its autodetect probe, so a disabled format compiles out
+# completely (down to an empty `Format` enum under `--no-default-features`).
+# These features add NO dependencies (the crate stays std-only).
+[features]
+default = [
+    "subrip",
+    "webvtt",
+    "ssa",
+    "sami",
+    "qttext",
+    "microdvd",
+    "mpl2",
+    "subviewer",
+    "tmplayer",
+    "mpsub",
+    "lrc",
+    "dks",
+]
+subrip = []
+webvtt = []
+ssa = []
+sami = []
+qttext = []
+microdvd = []
+mpl2 = []
+subviewer = []
+tmplayer = []
+mpsub = []
+lrc = []
+dks = []
+
+# Custom, dependency-free benchmarks (no criterion). Each is a plain binary that
+# times its parser with std::time::Instant. Run e.g.:
+#   cargo bench -p subparse-formats --bench subrip
+# Each bench references its format's parser struct, so it requires that feature.
+[[bench]]
+name = "subrip"
+harness = false
+required-features = ["subrip"]
+
+[[bench]]
+name = "microdvd"
+harness = false
+required-features = ["microdvd"]
+
+[[bench]]
+name = "mpl2"
+harness = false
+required-features = ["mpl2"]
+
+[[bench]]
+name = "subviewer"
+harness = false
+required-features = ["subviewer"]
+
+[[bench]]
+name = "sami"
+harness = false
+required-features = ["sami"]
+
+[[bench]]
+name = "tmplayer"
+harness = false
+required-features = ["tmplayer"]
+
+[[bench]]
+name = "mpsub"
+harness = false
+required-features = ["mpsub"]
+
+[[bench]]
+name = "qttext"
+harness = false
+required-features = ["qttext"]
+
+[[bench]]
+name = "lrc"
+harness = false
+required-features = ["lrc"]
+
+[[bench]]
+name = "dks"
+harness = false
+required-features = ["dks"]
+
+[[bench]]
+name = "webvtt"
+harness = false
+required-features = ["webvtt"]
+
+[[bench]]
+name = "ssa"
+harness = false
+required-features = ["ssa"]

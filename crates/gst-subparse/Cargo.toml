@@ -1,0 +1,62 @@
+[package]
+name = "gst-subparse"
+description = "Rust reimplementation of the GStreamer subparse plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25" }
+gst-base = { package = "gstreamer-base", version = "0.25" }
+subparse-formats = { path = "../subparse-formats", default-features = false }
+# Broad charset decoding for the non-UTF-8 paths (BOM-detected encodings, the
+# `encoding` property / GST_SUBTITLE_ENCODING, and the post-UTF-8-latch
+# fallback), mirroring the iconv-based conversion in the upstream C plugin. The
+# assumed-UTF-8 default path deliberately stays on std to keep the C's
+# `valid_utf8` latch and partial-tail-hold semantics (see src/encoding.rs).
+encoding_rs = "0.8"
+
+[dev-dependencies]
+gst-check = { package = "gstreamer-check", version = "0.25" }
+
+[build-dependencies]
+gst-plugin-version-helper = "0.8"
+
+# Per-format features, each forwarding to the matching `subparse-formats`
+# feature, so a consumer can pick the subtitle formats the plugin is built with.
+# `default` enables all of them (the full drop-in for the C plugin). The
+# `ssaparse` element additionally requires the `ssa` feature.
+[features]
+default = [
+    "subrip",
+    "webvtt",
+    "ssa",
+    "sami",
+    "qttext",
+    "microdvd",
+    "mpl2",
+    "subviewer",
+    "tmplayer",
+    "mpsub",
+    "lrc",
+    "dks",
+]
+subrip = ["subparse-formats/subrip"]
+webvtt = ["subparse-formats/webvtt"]
+ssa = ["subparse-formats/ssa"]
+sami = ["subparse-formats/sami"]
+qttext = ["subparse-formats/qttext"]
+microdvd = ["subparse-formats/microdvd"]
+mpl2 = ["subparse-formats/mpl2"]
+subviewer = ["subparse-formats/subviewer"]
+tmplayer = ["subparse-formats/tmplayer"]
+mpsub = ["subparse-formats/mpsub"]
+lrc = ["subparse-formats/lrc"]
+dks = ["subparse-formats/dks"]
+
+[lib]
+name = "gstrssubparse"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"

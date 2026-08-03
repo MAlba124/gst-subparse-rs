@@ -1,0 +1,170 @@
+[package]
+name = "gst-subparse-rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+authors = ["Marcus Hanestad <marlhan@proton.me>"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.subparse-formats]
+path = "../crates/subparse-formats"
+default-features = false
+
+# Per-format features forward to the matching `subparse-formats` feature, so a
+# per-format fuzz target can be built against only its format. `default` enables
+# all of them (so `cargo fuzz build` with no extra flags builds every target).
+# The `required-features` on each per-format `[[bin]]` below refer to THESE
+# features. The `autodetect`, `parse_any` and `typefind` targets only use
+# `autodetect::detect` / `Format` and build under any subset, so they carry no
+# `required-features`.
+[features]
+default = [
+    "subrip",
+    "webvtt",
+    "ssa",
+    "sami",
+    "qttext",
+    "microdvd",
+    "mpl2",
+    "subviewer",
+    "tmplayer",
+    "mpsub",
+    "lrc",
+    "dks",
+]
+subrip = ["subparse-formats/subrip"]
+webvtt = ["subparse-formats/webvtt"]
+ssa = ["subparse-formats/ssa"]
+sami = ["subparse-formats/sami"]
+qttext = ["subparse-formats/qttext"]
+microdvd = ["subparse-formats/microdvd"]
+mpl2 = ["subparse-formats/mpl2"]
+subviewer = ["subparse-formats/subviewer"]
+tmplayer = ["subparse-formats/tmplayer"]
+mpsub = ["subparse-formats/mpsub"]
+lrc = ["subparse-formats/lrc"]
+dks = ["subparse-formats/dks"]
+
+[[bin]]
+name = "subrip"
+path = "fuzz_targets/subrip.rs"
+test = false
+doc = false
+bench = false
+required-features = ["subrip"]
+
+[[bin]]
+name = "microdvd"
+path = "fuzz_targets/microdvd.rs"
+test = false
+doc = false
+bench = false
+required-features = ["microdvd"]
+
+[[bin]]
+name = "mpl2"
+path = "fuzz_targets/mpl2.rs"
+test = false
+doc = false
+bench = false
+required-features = ["mpl2"]
+
+[[bin]]
+name = "subviewer"
+path = "fuzz_targets/subviewer.rs"
+test = false
+doc = false
+bench = false
+required-features = ["subviewer"]
+
+[[bin]]
+name = "sami"
+path = "fuzz_targets/sami.rs"
+test = false
+doc = false
+bench = false
+required-features = ["sami"]
+
+[[bin]]
+name = "tmplayer"
+path = "fuzz_targets/tmplayer.rs"
+test = false
+doc = false
+bench = false
+required-features = ["tmplayer"]
+
+[[bin]]
+name = "mpsub"
+path = "fuzz_targets/mpsub.rs"
+test = false
+doc = false
+bench = false
+required-features = ["mpsub"]
+
+[[bin]]
+name = "qttext"
+path = "fuzz_targets/qttext.rs"
+test = false
+doc = false
+bench = false
+required-features = ["qttext"]
+
+[[bin]]
+name = "lrc"
+path = "fuzz_targets/lrc.rs"
+test = false
+doc = false
+bench = false
+required-features = ["lrc"]
+
+[[bin]]
+name = "dks"
+path = "fuzz_targets/dks.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dks"]
+
+[[bin]]
+name = "webvtt"
+path = "fuzz_targets/webvtt.rs"
+test = false
+doc = false
+bench = false
+required-features = ["webvtt"]
+
+[[bin]]
+name = "ssa"
+path = "fuzz_targets/ssa.rs"
+test = false
+doc = false
+bench = false
+required-features = ["ssa"]
+
+[[bin]]
+name = "autodetect"
+path = "fuzz_targets/autodetect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_any"
+path = "fuzz_targets/parse_any.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "typefind"
+path = "fuzz_targets/typefind.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
