@@ -98,6 +98,15 @@ pub trait SubtitleFormat {
     fn stylesheet(&self) -> Option<&crate::vttcss::Stylesheet> {
         None
     }
+
+    /// The SSA/ASS style registry collected so far ([`crate::ssastyle`]),
+    /// `Some` for the SSA parser only. The header sections precede the
+    /// `[Events]`, so by the time a cue comes out the styles it references
+    /// are here. Consumed by the `cue-ir` path together with the cue's
+    /// [`crate::ssastyle::SsaDialogue`]; pango-markup output never reads it.
+    fn ssa_styles(&self) -> Option<&crate::ssastyle::SsaStyles> {
+        None
+    }
 }
 
 /// Splits an incrementally-growing body into complete (`\n`-terminated) lines.

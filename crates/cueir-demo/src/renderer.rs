@@ -10,11 +10,11 @@
 //!
 //! What is mapped today: per-span font family/size/weight/style, underline,
 //! strikethrough, foreground color, span background boxes, letter spacing,
-//! and the cue-level layout (`position`/`line`/`size`/`align`). Not mapped
-//! yet (the IR carries them, the receiver's renderer will want them):
-//! outline, shadow, baseline shift (ruby annotations, sub/superscript),
-//! glyph scale, per-span language, vertical writing modes, karaoke
-//! `reveal_ns`.
+//! and the cue-level layout (`position`/`line`/`size`/`align`, the SSA
+//! anchor/origin/margins). Not mapped yet (the IR carries them, the
+//! receiver's renderer will want them): outline, shadow, baseline shift
+//! (ruby annotations, sub/superscript), glyph scale, per-span language,
+//! vertical writing modes, karaoke `reveal_ns`.
 
 use std::ops::Range;
 
@@ -74,7 +74,8 @@ impl CueRenderer {
     /// frame content already in it); this only adds the cue on top.
     pub fn draw(&mut self, ir: &CueIr, rc: &mut RenderContext, width: u16, height: u16) {
         // House style: ~5.3% of the frame height (≈38 px on 720p).
-        let base_px = height as f32 * 0.053;
+        let frame_h = height as f32;
+        let base_px = frame_h * 0.053;
         // Cue box width from the `size` setting, default 90% of the frame.
         let size_pct = ir.layout.size.unwrap_or(90.0).clamp(1.0, 100.0);
         let max_advance = width as f32 * size_pct / 100.0;
@@ -109,7 +110,11 @@ impl CueRenderer {
         }));
         b.push_default(GenericFamily::SansSerif);
         b.push_default(LineHeight::FontSizeRelative(1.2));
-        b.push_default(StyleProperty::FontSize(font_px(base.font_size, base_px)));
+        b.push_default(StyleProperty::FontSize(font_px(
+            base.font_size,
+            base_px,
+            frame_h,
+        )));
         if let Some(family) = base.font_family.as_deref() {
             b.push_default(FontFamilyName::Named(family.into()));
         }
@@ -155,7 +160,7 @@ impl CueRenderer {
             }
             if s.font_size.is_some() {
                 b.push(
-                    StyleProperty::FontSize(font_px(s.font_size, base_px)),
+                    StyleProperty::FontSize(font_px(s.font_size, base_px, frame_h)),
                     range.clone(),
                 );
             }
@@ -188,19 +193,44 @@ impl CueRenderer {
             return;
         }
 
-        // Position the cue box on the frame. `position` and `line` are
-        // percentages; the default is the customary bottom-center strip.
-        let x = match ir.layout.position {
-            Some(p) => width as f32 * p / 100.0 - max_advance / 2.0,
-            None => (width as f32 - max_advance) / 2.0,
+        // Position the cue box on the frame. An explicit SSA origin (`\pos`)
+        // places the anchor point exactly; otherwise `position`/`line`
+        // (WebVTT, percentages) or the anchor's own frame region (SSA, with
+        // margins) apply; the default is the customary bottom-center strip.
+        let (fw, fh) = (width as f32, height as f32);
+        let anchor = ir.layout.anchor.unwrap_or(ir::Anchor::BottomCenter);
+        let (col, row) = anchor_cell(anchor);
+        let x = if let Some((ox, _)) = ir.layout.origin {
+            fw * ox / 100.0 - max_advance * col
+        } else {
+            match ir.layout.position {
+                Some(p) => fw * p / 100.0 - max_advance / 2.0,
+                None => (fw - max_advance) / 2.0,
+            }
         }
-        .clamp(0.0, (width as f32 - max_advance).max(0.0));
-        let y = match ir.layout.line {
-            Some(ir::LinePosition::Percent(p)) => height as f32 * p / 100.0,
-            // Line numbers and the default both land on the bottom strip.
-            _ => height as f32 * 0.94 - lh,
+        .clamp(0.0, (fw - max_advance).max(0.0));
+        let y = if let Some((_, oy)) = ir.layout.origin {
+            fh * oy / 100.0 - lh * row
+        } else if let Some(ir::LinePosition::Percent(p)) = ir.layout.line {
+            fh * p / 100.0
+        } else {
+            // The anchor's frame region, kept clear of the margins (default
+            // 6%, the strip the old hard-coded 0.94 gave).
+            let mv = ir
+                .layout
+                .margins
+                .map(|m| m.vertical)
+                .filter(|v| *v > 0.0)
+                .unwrap_or(6.0)
+                / 100.0
+                * fh;
+            match row {
+                r if r == 0.0 => mv,
+                r if r == 1.0 => fh - mv - lh,
+                _ => (fh - lh) / 2.0,
+            }
         }
-        .clamp(0.0, (height as f32 - lh).max(0.0));
+        .clamp(0.0, (fh - lh).max(0.0));
 
         rc.set_transform(Affine::translate(Vec2::new(x as f64, y as f64)));
 
@@ -309,16 +339,36 @@ fn color(c: ir::Color) -> Color {
     Color::from_rgba8(c.r, c.g, c.b, c.a)
 }
 
+/// The anchor's fractional cell: `(column, row)` with `0.0` = left/top,
+/// `0.5` = center, `1.0` = right/bottom — the fraction of the cue box that
+/// sits before the anchor point.
+fn anchor_cell(a: ir::Anchor) -> (f32, f32) {
+    use ir::Anchor::*;
+    match a {
+        TopLeft => (0.0, 0.0),
+        TopCenter => (0.5, 0.0),
+        TopRight => (1.0, 0.0),
+        CenterLeft => (0.0, 0.5),
+        Center => (0.5, 0.5),
+        CenterRight => (1.0, 0.5),
+        BottomLeft => (0.0, 1.0),
+        BottomCenter => (0.5, 1.0),
+        BottomRight => (1.0, 1.0),
+    }
+}
+
 fn pt_to_px(pt: f32) -> f32 {
     pt * 96.0 / 72.0
 }
 
 /// IR font size -> pixels. Absolute point sizes get the CSS pt->px factor;
-/// scales are relative to the frame's base cue size.
-fn font_px(size: Option<ir::FontSize>, base_px: f32) -> f32 {
+/// scales are relative to the frame's base cue size; frame-height percents
+/// (SSA) are relative to the frame itself.
+fn font_px(size: Option<ir::FontSize>, base_px: f32, frame_h: f32) -> f32 {
     match size {
         Some(ir::FontSize::Points(pt)) => pt_to_px(pt),
         Some(ir::FontSize::Scale(s)) => base_px * s,
+        Some(ir::FontSize::FrameHeightPercent(p)) => frame_h * p / 100.0,
         None => base_px,
     }
 }

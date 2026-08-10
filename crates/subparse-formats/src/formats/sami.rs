@@ -146,6 +146,7 @@ impl SamiContext {
                 text,
                 settings: CueSettings::default(),
                 id: None,
+                ssa: None,
             });
         }
         None

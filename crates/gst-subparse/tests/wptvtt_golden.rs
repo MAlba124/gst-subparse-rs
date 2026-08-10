@@ -106,6 +106,7 @@ fn fmt_size(s: FontSize) -> String {
     match s {
         FontSize::Points(p) => format!("{p}pt"),
         FontSize::Scale(f) => format!("scale({f})"),
+        FontSize::FrameHeightPercent(p) => format!("{p}%fh"),
     }
 }
 

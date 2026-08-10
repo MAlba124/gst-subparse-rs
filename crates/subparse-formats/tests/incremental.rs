@@ -250,7 +250,7 @@ fn fixtures() -> Vec<Fixture> {
                Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
                Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Hello {\\i1}wörld{\\i0}\n\
                Dialogue: 0,not-a-time,0:00:03.00,Default,,0,0,0,,dropped\n\
-               Dialogue: 0,0:00:03.50,0:00:05.00,Default,,0,0,0,,Second\\Nline\n\
+               Dialogue: 0,0:00:03.50,0:00:05.00,Default,,12,0,24,,{\\an8\\k25}Second\\Nline\n\
                Comment: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,ignored\n\
                Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,Trailing, unterminated",
     });

@@ -17,6 +17,7 @@ pub mod cue;
 pub mod format;
 pub mod formats;
 pub mod ir;
+pub mod ssastyle;
 pub mod vttcss;
 
 pub use cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};

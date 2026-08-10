@@ -70,15 +70,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => DEMO_VTT.as_bytes().to_vec(),
     };
 
-    // The caps only get the stream linked; rssubparse detects the actual
-    // format from the content.
-    let pipeline = gst::parse::launch(
+    // SSA/ASS is the separate ssaparse element (as upstream); everything else
+    // goes to rssubparse, which detects the actual format from the content —
+    // the caps only get the stream linked.
+    let is_ssa = input.as_deref().is_some_and(|p| {
+        std::path::Path::new(p)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("ass") || e.eq_ignore_ascii_case("ssa"))
+    });
+    let launch = if is_ssa {
+        "appsrc name=src caps=application/x-ssa \
+         ! rsssaparse text-format=cue-ir \
+         ! appsink name=sink sync=false"
+    } else {
         "appsrc name=src caps=application/x-subtitle \
          ! rssubparse text-format=cue-ir \
-         ! appsink name=sink sync=false",
-    )?
-    .downcast::<gst::Pipeline>()
-    .expect("a launch line is a pipeline");
+         ! appsink name=sink sync=false"
+    };
+    let pipeline = gst::parse::launch(launch)?
+        .downcast::<gst::Pipeline>()
+        .expect("a launch line is a pipeline");
     let src = pipeline
         .by_name("src")
         .unwrap()

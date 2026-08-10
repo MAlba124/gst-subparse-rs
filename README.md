@@ -32,8 +32,15 @@ blocks are parsed (`::cue` selectors with classes, voices, ids, `:lang`;
 colors, fonts, text-shadow, outline, ruby-position — see
 `subparse_formats::vttcss`) and applied to the IR with CSS cascade semantics,
 and both the archaic (`T:`/`A:`/...) and modern (`align:center
-position:50%`) cue-settings syntaxes fold into the IR's layout. The default
-pango-markup output stays byte-identical to the C either way.
+position:50%`) cue-settings syntaxes fold into the IR's layout.
+
+For SSA/ASS, cue-ir mode reads the `[V4(+) Styles]` definitions (from the
+file or from a container's `codec_data`) and the `{\...}` override tags the C
+strips: colors, fonts, bold/italic/underline/strikeout, outline and shadow,
+`\an`/`\pos` placement, margins, karaoke timing as per-span reveal times —
+see `subparse_formats::ssastyle`.
+
+The default pango-markup output stays byte-identical to the C either way.
 
 [crates/cueir-demo](crates/cueir-demo/) is a runnable end-to-end demo of
 exactly that (a standalone crate, not a workspace member): it pipes a subtitle

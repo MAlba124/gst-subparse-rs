@@ -283,6 +283,9 @@ pub enum FontSize {
     Points(f32),
     /// A factor applied to the renderer's base cue size (`1.0` = base).
     Scale(f32),
+    /// Percent of the video frame height in `[0, 100]` (SSA/ASS sizes, which
+    /// live in `PlayRes` pixel space and scale with the frame).
+    FrameHeightPercent(f32),
 }
 
 /// A text outline (SSA/ASS border, CC edge). Drawn as a stroke behind the
@@ -1639,6 +1642,7 @@ mod tests {
                 ..CueSettings::default()
             },
             id: None,
+            ssa: None,
         };
         let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
         assert_eq!(ir.layout.line, Some(LinePosition::Percent(10.0)));
@@ -1664,6 +1668,7 @@ mod tests {
                 ..CueSettings::default()
             },
             id: None,
+            ssa: None,
         };
         let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
         assert_eq!(ir.layout.line, Some(LinePosition::Line(-1)));

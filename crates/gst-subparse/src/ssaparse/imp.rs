@@ -40,10 +40,11 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use subparse_formats::formats::ssa::dialogue_to_pango_markup;
+use subparse_formats::formats::ssa::{dialogue_to_pango_markup, framed_dialogue};
 use subparse_formats::ir::{self, CueIr};
+use subparse_formats::ssastyle::{self, SsaStyles};
 use subparse_formats::{Format, ParseContext, SubtitleFormat};
 
 use crate::cueir::{CueIrMeta, TextFormat};
@@ -77,6 +78,10 @@ struct State {
     /// buffer. Set by the CAPS event and therefore kept across a stream restart,
     /// which does not re-negotiate.
     framed: bool,
+    /// Style registry parsed from the `codec_data` init section (framed mode
+    /// only; the whole-file parser collects its own). Consumed by the
+    /// `cue-ir` path; from the caps, so it survives a stream restart.
+    styles: Option<Arc<SsaStyles>>,
     /// The charset a previous framed buffer was decided to be, or `None` while
     /// every buffer so far read as UTF-8. Handed to the following buffers as
     /// their fallback so one stream cannot decode two ways.
@@ -110,6 +115,7 @@ impl Default for State {
     fn default() -> Self {
         State {
             framed: false,
+            styles: None,
             charset_latch: None,
             decoder: Decoder::new(),
             pending: Vec::new(),
@@ -134,12 +140,14 @@ impl State {
     /// over from must be a *fresh* one: the charset decoder refuses to be fed
     /// after it has been finished at EOS (it is a one-shot at that point), and
     /// the format parser's state is a position within the stream that just
-    /// ended. `framed` survives because it comes from the caps, and the caps are
-    /// not re-sent for a new stream on the same pad.
+    /// ended. `framed` and `styles` survive because they come from the caps,
+    /// and the caps are not re-sent for a new stream on the same pad.
     fn restart(&mut self) {
         let framed = self.framed;
+        let styles = self.styles.take();
         *self = State::default();
         self.framed = framed;
+        self.styles = styles;
     }
 }
 
@@ -223,7 +231,7 @@ impl SsaParse {
             return;
         };
 
-        match codec_data.map_readable() {
+        let styles = match codec_data.map_readable() {
             Ok(map) => {
                 let bytes = map.as_slice();
                 let bytes = bytes.strip_prefix(&BOM_UTF8).unwrap_or(bytes);
@@ -235,8 +243,10 @@ impl SsaParse {
                     );
                 }
                 // The C keeps the section as UTF-8 text, truncated at the first
-                // byte that is not, and never reads it back, so log it at the
-                // level its own GST_LOG uses instead of storing it.
+                // byte that is not, and never reads it back ("FIXME: parse
+                // initial section"). We log it like its GST_LOG does — and,
+                // for the cue-ir path, actually parse the [Script Info] and
+                // [V4(+) Styles] sections out of it.
                 let init = match std::str::from_utf8(bytes) {
                     Ok(text) => text,
                     Err(err) => {
@@ -251,14 +261,18 @@ impl SsaParse {
                     }
                 };
                 gst::log!(CAT, imp = self, "Init section:\n{}", init);
+                Some(Arc::new(SsaStyles::parse(init)))
             }
             Err(_) => {
                 gst::warning!(CAT, imp = self, "Failed to map codec_data readable");
+                None
             }
-        }
+        };
 
         gst::debug!(CAT, imp = self, "codec_data present, input is framed");
-        self.state.lock().unwrap().framed = true;
+        let mut state = self.state.lock().unwrap();
+        state.framed = true;
+        state.styles = styles;
     }
 
     /// The events downstream still has to be told about, in the order they have
@@ -337,14 +351,14 @@ impl SsaParse {
 
         // Settings before state, the order every other site uses.
         let text_format = self.settings.lock().unwrap().text_format;
-        let (events, text, ir_mode) = {
+        let (events, text, ir_mode, styles) = {
             let mut state = self.state.lock().unwrap();
             if state.flushing {
                 return Err(gst::FlowError::Flushing);
             }
             let events = self.pending_events(&mut state, text_format);
             let text = decode_frame(&mut state, map.as_slice());
-            (events, text, state.ir_mode)
+            (events, text, state.ir_mode, state.styles.clone())
         };
 
         // The row is one line and its terminator is not part of the text. The C
@@ -400,7 +414,19 @@ impl SsaParse {
         // to " \n".
         let markup = markup.trim_end_matches(['\n', '\r']);
         let (text, cue_ir) = if ir_mode {
-            let cue_ir = CueIr::from_pango_markup(markup);
+            // The styled path: the raw row (override blocks intact) plus the
+            // codec_data style registry. `markup` being `Some` means the row
+            // had its 8 commas, so `framed_dialogue` cannot fail; the
+            // fallback keeps a plain IR coming out even if it somehow does.
+            let cue_ir = match framed_dialogue(line) {
+                Some(d) => {
+                    let start_ns = pts.map(gst::ClockTime::nseconds).unwrap_or(0);
+                    let default_styles = SsaStyles::default();
+                    let styles = styles.as_deref().unwrap_or(&default_styles);
+                    ssastyle::dialogue_to_ir(&d, styles, start_ns)
+                }
+                None => CueIr::from_pango_markup(markup),
+            };
             (cue_ir.plain_text(), Some(cue_ir))
         } else {
             (markup.to_owned(), None)
@@ -476,12 +502,23 @@ impl SsaParse {
         state.textbuf.drain(..consumed);
 
         let ir_mode = state.ir_mode;
+        // The parser collects [Script Info] and [V4(+) Styles] as they stream
+        // by; each cue carries its dialogue extras (raw text, style name,
+        // margins). Together they rebuild the styled cue.
+        let ssa_styles = if ir_mode {
+            state.parser.as_deref().and_then(|p| p.ssa_styles())
+        } else {
+            None
+        };
         let mut buffers: Vec<gst::Buffer> = Vec::new();
         for cue in &parsed.cues {
             let (text, cue_ir) = if ir_mode {
-                // The whole-file parser emits pango-markup flavoured text
-                // (escaped plain text today, see `formats::ssa`).
-                let cue_ir = ir::cue_to_ir(cue, subparse_formats::OutputFormat::PangoMarkup, None);
+                let cue_ir = match (ssa_styles, cue.ssa.as_deref()) {
+                    (Some(styles), Some(d)) => ssastyle::dialogue_to_ir(d, styles, cue.start_ns),
+                    // No extras (shouldn't happen for SSA): fall back to the
+                    // stripped pango-flavoured text.
+                    _ => ir::cue_to_ir(cue, subparse_formats::OutputFormat::PangoMarkup, None),
+                };
                 (cue_ir.plain_text(), Some(cue_ir))
             } else {
                 (cue.text.trim_end_matches(['\n', '\r']).to_owned(), None)

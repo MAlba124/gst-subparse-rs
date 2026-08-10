@@ -17,6 +17,7 @@
 
 use crate::cue::{Cue, OutputFormat, ParseContext, ParseError};
 use crate::format::{LineScanner, Parsed, SubtitleFormat};
+use crate::ssastyle::{SsaDialogue, SsaStyles};
 
 /// Parser for the SSA/ASS subtitle format (whole-file `[Events]` parsing).
 ///
@@ -97,6 +98,12 @@ impl SubtitleFormat for Ssa {
         // gstssaparse.c advertises `text/x-raw, format=pango-markup`.
         OutputFormat::PangoMarkup
     }
+
+    fn ssa_styles(&self) -> Option<&SsaStyles> {
+        // Always present for SSA (an empty registry still lets the cue-ir
+        // path parse override tags with default styling).
+        Some(&self.machine.styles)
+    }
 }
 
 /// The `[Events]`-section scanner, carried across `parse_incremental` calls.
@@ -116,6 +123,17 @@ struct Machine {
     /// no `Text` column at all (Dialogue lines are then dropped, there is no
     /// text to emit).
     col_text: Option<usize>,
+    /// Columns feeding the cue's [`SsaDialogue`] (styling for the `cue-ir`
+    /// path). `None` when a `Format:` line omits them; the dialogue then
+    /// carries defaults, which the text extraction never notices.
+    col_style: Option<usize>,
+    col_margin_l: Option<usize>,
+    col_margin_r: Option<usize>,
+    col_margin_v: Option<usize>,
+    /// `[Script Info]` + `[V4(+) Styles]` collected on the side for the
+    /// `cue-ir` path. Feeding it every line is parity-neutral: it only reads
+    /// sections the text extraction ignores.
+    styles: SsaStyles,
 }
 
 impl Default for Machine {
@@ -125,6 +143,11 @@ impl Default for Machine {
             col_start: 1,
             col_end: 2,
             col_text: Some(9),
+            col_style: Some(3),
+            col_margin_l: Some(5),
+            col_margin_r: Some(6),
+            col_margin_v: Some(7),
+            styles: SsaStyles::default(),
         }
     }
 }
@@ -136,6 +159,8 @@ impl Machine {
         if trimmed.is_empty() {
             return;
         }
+
+        self.styles.feed_line(trimmed);
 
         // Section header, e.g. "[Events]", "[Script Info]". The name ends at
         // the first ']' and anything after it (a stray comment, say) is
@@ -164,6 +189,10 @@ impl Machine {
             // nothing. A header that never names Text leaves `col_text` unset
             // and every following Dialogue line is dropped.
             self.col_text = None;
+            self.col_style = None;
+            self.col_margin_l = None;
+            self.col_margin_r = None;
+            self.col_margin_v = None;
             for (i, n) in value.split(',').map(str::trim).enumerate() {
                 if n.eq_ignore_ascii_case("Start") {
                     self.col_start = i;
@@ -171,14 +200,55 @@ impl Machine {
                     self.col_end = i;
                 } else if n.eq_ignore_ascii_case("Text") {
                     self.col_text = Some(i);
+                } else if n.eq_ignore_ascii_case("Style") {
+                    self.col_style = Some(i);
+                } else if n.eq_ignore_ascii_case("MarginL") {
+                    self.col_margin_l = Some(i);
+                } else if n.eq_ignore_ascii_case("MarginR") {
+                    self.col_margin_r = Some(i);
+                } else if n.eq_ignore_ascii_case("MarginV") {
+                    self.col_margin_v = Some(i);
                 }
             }
         } else if keyword.eq_ignore_ascii_case("Dialogue")
-            && let Some(cue) = parse_dialogue(value, self.col_start, self.col_end, self.col_text)
+            && let Some(cue) = self.parse_dialogue(value)
         {
             cues.push(cue);
         }
         // "Comment:" and any other keyword inside [Events] are ignored.
+    }
+
+    fn parse_dialogue(&self, value: &str) -> Option<Cue> {
+        let col_text = self.col_text?;
+        // Keep at most `col_text + 1` fields so the Text field retains its
+        // commas. Text is the last column in a well-formed header, making
+        // that the declared column count. The spec asserts Text is always
+        // last, so when a header declares it earlier anyway we keep the same
+        // reading: the text starts at its declared field index and runs to
+        // the end of the line. Columns declared after Text are then
+        // unreachable, and a Dialogue whose Start or End sits past Text is
+        // dropped by the lookups below.
+        let fields: Vec<&str> = value.splitn(col_text + 1, ',').collect();
+        if fields.len() < col_text + 1 {
+            return None; // missing fields, skip like the C's lenient recovery
+        }
+        let start = parse_ass_time(fields.get(self.col_start)?.trim())?;
+        let end = parse_ass_time(fields.get(self.col_end)?.trim())?;
+        let raw_text = fields[col_text];
+        let text = strip_to_pango_markup(raw_text);
+
+        let field = |col: Option<usize>| col.and_then(|i| fields.get(i)).map(|f| f.trim());
+        let margin =
+            |col: Option<usize>| field(col).and_then(|f| f.parse::<u32>().ok()).unwrap_or(0);
+        let mut cue = Cue::new(start, Some(end), text);
+        cue.ssa = Some(Box::new(SsaDialogue {
+            raw_text: raw_text.to_owned(),
+            style: field(self.col_style).unwrap_or_default().to_owned(),
+            margin_l: margin(self.col_margin_l),
+            margin_r: margin(self.col_margin_r),
+            margin_v: margin(self.col_margin_v),
+        }));
+        Some(cue)
     }
 }
 
@@ -196,6 +266,25 @@ impl Machine {
 pub fn dialogue_to_pango_markup(line: &str) -> Option<String> {
     let text_field = skip_commas(line, 8)?;
     Some(strip_to_pango_markup(text_field))
+}
+
+/// Extract the [`SsaDialogue`] extras from the same container-framed row
+/// layout [`dialogue_to_pango_markup`] walks (`ReadOrder,Layer,Style,Name,
+/// MarginL,MarginR,MarginV,Effect,Text`). Returns `None` when the line has
+/// fewer than 8 commas, exactly when `dialogue_to_pango_markup` does. Only
+/// the `cue-ir` output path calls this.
+pub fn framed_dialogue(line: &str) -> Option<SsaDialogue> {
+    let fields: Vec<&str> = line.splitn(9, ',').collect();
+    if fields.len() < 9 {
+        return None;
+    }
+    Some(SsaDialogue {
+        raw_text: fields[8].to_owned(),
+        style: fields[2].trim().to_owned(),
+        margin_l: fields[4].trim().parse().unwrap_or(0),
+        margin_r: fields[5].trim().parse().unwrap_or(0),
+        margin_v: fields[6].trim().parse().unwrap_or(0),
+    })
 }
 
 /// Turn a raw SSA/ASS *Text field* into Pango markup, exactly as the C
@@ -358,30 +447,6 @@ fn split_keyword(line: &str) -> Option<(&str, &str)> {
     // the commas and are untouched.
     let val = line[idx + 1..].trim_start_matches(' ');
     Some((key, val))
-}
-
-fn parse_dialogue(
-    value: &str,
-    col_start: usize,
-    col_end: usize,
-    col_text: Option<usize>,
-) -> Option<Cue> {
-    let col_text = col_text?;
-    // Keep at most `col_text + 1` fields so the Text field retains its commas.
-    // Text is the last column in a well-formed header, making that the
-    // declared column count. The spec asserts Text is always last, so when a
-    // header declares it earlier anyway we keep the same reading: the text
-    // starts at its declared field index and runs to the end of the line.
-    // Columns declared after Text are then unreachable, and a Dialogue whose
-    // Start or End sits past Text is dropped by the lookups below.
-    let fields: Vec<&str> = value.splitn(col_text + 1, ',').collect();
-    if fields.len() < col_text + 1 {
-        return None; // missing fields, skip like the C's lenient recovery
-    }
-    let start = parse_ass_time(fields.get(col_start)?.trim())?;
-    let end = parse_ass_time(fields.get(col_end)?.trim())?;
-    let text = strip_to_pango_markup(fields[col_text]);
-    Some(Cue::new(start, Some(end), text))
 }
 
 /// Parse an SSA/ASS timestamp `H:MM:SS.cc` (hours 1+ digits, centiseconds by
@@ -712,6 +777,57 @@ Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,fine
         let cues = p.parse(body, &ParseContext::default()).unwrap();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, "fine");
+    }
+
+    // --- styles collection and SsaDialogue (the cue-ir side channel) --------
+
+    #[test]
+    fn styles_and_dialogue_extras_are_collected() {
+        let body = "\
+[Script Info]
+PlayResX: 640
+PlayResY: 480
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, Alignment
+Style: Top,Arial,32,&H0000FFFF,8
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.00,Top,,12,0,48,,{\\i1}Hello
+";
+        let mut p = Ssa::default();
+        let cues = p.parse(body, &ParseContext::default()).unwrap();
+        assert_eq!(cues.len(), 1);
+        // Parity: the pango text is still the stripped form.
+        assert_eq!(cues[0].text, "Hello");
+
+        let d = cues[0].ssa.as_deref().expect("dialogue extras attached");
+        assert_eq!(d.raw_text, "{\\i1}Hello");
+        assert_eq!(d.style, "Top");
+        assert_eq!((d.margin_l, d.margin_r, d.margin_v), (12, 0, 48));
+
+        let styles = p.ssa_styles().expect("SSA always exposes a registry");
+        assert_eq!(styles.play_res(), (640.0, 480.0));
+        let style = styles.lookup("Top").expect("style collected");
+        assert_eq!(style.font_size, Some(32.0));
+        assert_eq!(style.alignment, Some(8));
+    }
+
+    #[test]
+    fn custom_event_format_resolves_style_and_margins() {
+        let body = "\
+[Events]
+Format: Start, End, MarginV, Style, Text
+Dialogue: 0:00:01.00,0:00:02.00,24,Alt,Hi there
+";
+        let mut p = Ssa::default();
+        let cues = p.parse(body, &ParseContext::default()).unwrap();
+        let d = cues[0].ssa.as_deref().unwrap();
+        assert_eq!(d.style, "Alt");
+        assert_eq!(d.margin_v, 24);
+        assert_eq!(d.margin_l, 0);
+        assert_eq!(d.raw_text, "Hi there");
     }
 
     #[test]

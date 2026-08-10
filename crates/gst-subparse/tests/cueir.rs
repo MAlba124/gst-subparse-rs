@@ -218,8 +218,13 @@ fn subparse_default_output_ignores_style_blocks() {
 }
 
 /// One framed SSA dialogue row through `rsssaparse` (the container shape:
-/// `codec_data` in caps, one row per timed buffer).
-fn run_ssaparse_framed(row: &str, format: Option<&str>) -> gst::Buffer {
+/// `codec_data` in caps, one row per timed buffer). `init_section` is the
+/// codec_data payload.
+fn run_ssaparse_framed_with_init(
+    row: &str,
+    format: Option<&str>,
+    init_section: &str,
+) -> gst::Buffer {
     init();
 
     let mut h = gst_check::Harness::new("rsssaparse");
@@ -229,7 +234,7 @@ fn run_ssaparse_framed(row: &str, format: Option<&str>) -> gst::Buffer {
             .set_property_from_str("text-format", format);
     }
 
-    let codec_data = gst::Buffer::from_slice("[Script Info]\n".as_bytes().to_vec());
+    let codec_data = gst::Buffer::from_slice(init_section.as_bytes().to_vec());
     let caps = gst::Caps::builder("application/x-ssa")
         .field("codec_data", codec_data)
         .build();
@@ -243,6 +248,10 @@ fn run_ssaparse_framed(row: &str, format: Option<&str>) -> gst::Buffer {
     }
     h.push(buffer).expect("push succeeded");
     h.try_pull().expect("one cue")
+}
+
+fn run_ssaparse_framed(row: &str, format: Option<&str>) -> gst::Buffer {
+    run_ssaparse_framed_with_init(row, format, "[Script Info]\n")
 }
 
 const SSA_ROW: &str = "1,0,Default,,0,0,0,,{\\i1}Hello & <world>";
@@ -263,4 +272,93 @@ fn ssaparse_cue_ir_pushes_plain_text_with_meta() {
 
     let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
     assert_eq!(meta.ir().plain_text(), "Hello & <world>");
+    // The {\i1} the pango path strips reaches the IR as real styling now.
+    assert_eq!(
+        meta.ir().lines[0].spans[0].style.font_style,
+        Some(FontStyle::Italic)
+    );
+}
+
+#[test]
+fn ssaparse_cue_ir_applies_codec_data_styles_and_overrides() {
+    let init = "[Script Info]\n\
+                PlayResX: 384\n\
+                PlayResY: 288\n\n\
+                [V4+ Styles]\n\
+                Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, Bold, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV\n\
+                Style: Default,DejaVu Sans,24,&H0000FFFF,&H00000000,-1,1,2,1,2,10,10,20\n";
+    let row = "1,0,Default,,0,0,0,,{\\an8\\c&H00FF00&}Top {\\i1}green";
+    let buffer = run_ssaparse_framed_with_init(row, Some("cue-ir"), init);
+    assert_eq!(text_of(&buffer), "Top green");
+
+    let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
+    let ir = meta.ir();
+    // The style definition became the cue's base...
+    assert_eq!(ir.base.font_family.as_deref(), Some("DejaVu Sans"));
+    assert_eq!(ir.base.foreground, Some(Color::rgb(255, 255, 0)));
+    assert_eq!(ir.base.font_weight, Some(700));
+    assert_eq!(
+        ir.base.font_size,
+        Some(subparse_formats::ir::FontSize::FrameHeightPercent(
+            24.0 / 288.0 * 100.0
+        ))
+    );
+    // ...its alignment was overridden by {\an8}...
+    assert_eq!(
+        ir.layout.anchor,
+        Some(subparse_formats::ir::Anchor::TopCenter)
+    );
+    // ...and the margins were normalised out of PlayRes space.
+    let margins = ir.layout.margins.unwrap();
+    assert!((margins.vertical - 20.0 / 288.0 * 100.0).abs() < 1e-4);
+    // Span styling from the override tags.
+    let spans: Vec<_> = ir.lines.iter().flat_map(|l| l.spans.iter()).collect();
+    assert_eq!(spans[0].style.foreground, Some(Color::rgb(0, 255, 0)));
+    assert_eq!(spans[0].style.font_style, None);
+    assert_eq!(spans[1].style.font_style, Some(FontStyle::Italic));
+}
+
+#[test]
+fn ssaparse_whole_file_cue_ir_is_styled() {
+    // Whole-file mode (no codec_data): the parser collects the header
+    // sections itself.
+    let body = "[Script Info]\n\
+                PlayResY: 288\n\n\
+                [V4+ Styles]\n\
+                Format: Name, Fontname, PrimaryColour\n\
+                Style: Default,Arial,&H000000FF\n\n\
+                [Events]\n\
+                Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+                Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\b1}Bold\\Nsecond\n";
+    init();
+
+    let mut h = gst_check::Harness::new("rsssaparse");
+    h.element()
+        .unwrap()
+        .set_property_from_str("text-format", "cue-ir");
+    h.set_src_caps_str("application/x-ssa");
+    h.push(gst::Buffer::from_slice(body.as_bytes().to_vec()))
+        .expect("push succeeded");
+    h.push_event(gst::event::Eos::new());
+
+    let buffer = h.try_pull().expect("one cue");
+    // Clean line break (the pango path's " \n" quirk is markup-only).
+    assert_eq!(text_of(&buffer), "Bold\nsecond");
+    let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
+    let ir = meta.ir();
+    assert_eq!(ir.base.foreground, Some(Color::rgb(255, 0, 0)));
+    assert_eq!(ir.base.font_family.as_deref(), Some("Arial"));
+    assert_eq!(ir.lines.len(), 2);
+    assert_eq!(ir.lines[0].spans[0].style.font_weight, Some(700));
+}
+
+#[test]
+fn ssaparse_default_output_ignores_styles() {
+    // Parity: with a style-bearing init section, pango-markup output is the
+    // stripped text with no meta, exactly as before.
+    let init = "[Script Info]\n\n[V4+ Styles]\n\
+                Format: Name, PrimaryColour\nStyle: Default,&H0000FF&\n";
+    let buffer = run_ssaparse_framed_with_init(SSA_ROW, None, init);
+    assert_eq!(text_of(&buffer), "Hello &amp; &lt;world&gt;");
+    assert!(buffer.meta::<CueIrMeta>().is_none());
 }

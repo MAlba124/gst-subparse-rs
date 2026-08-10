@@ -57,6 +57,10 @@ pub struct Cue {
     /// consumed by the `cue-ir` output path (`::cue(#id)` selectors); the
     /// pango-markup output ignores it, like the C element.
     pub id: Option<String>,
+    /// SSA/ASS extras (the raw Text field with override blocks intact, style
+    /// name, margin overrides). Only consumed by the `cue-ir` output path;
+    /// the pango-markup output ignores it, like the C element.
+    pub ssa: Option<Box<crate::ssastyle::SsaDialogue>>,
 }
 
 impl Cue {
@@ -68,6 +72,7 @@ impl Cue {
             text: text.into(),
             settings: CueSettings::default(),
             id: None,
+            ssa: None,
         }
     }
 

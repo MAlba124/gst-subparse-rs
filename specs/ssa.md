@@ -92,6 +92,47 @@ The element's output caps are `text/x-raw, format=pango-markup`, so
 emitted. Styling override tags are discarded, not converted. (Full ASS styling
 would require a real renderer such as libass, out of scope and matching upstream.)
 
+## Styling (cue-ir only)
+
+`text-format=cue-ir` gets the styling the text extraction throws away,
+implemented in `crates/subparse-formats/src/ssastyle.rs` and applied by both
+elements. The pango-markup output is untouched.
+
+**Collection.** The whole-file parser feeds every line to an `SsaStyles`
+collector on the side (`[Script Info]` `PlayResX/Y`, `[V4 Styles]` /
+`[V4+ Styles]` with `Format:`-driven columns, v4's legacy alignment encoding
+and `TertiaryColour` translated), and attaches an `SsaDialogue` (raw Text
+field, style name, margin overrides) to every cue — the `Style`/`MarginL/R/V`
+event columns are resolved from the `[Events]` `Format:` line like
+`Start`/`End`/`Text`. In framed mode the `ssaparse` element parses the same
+sections out of `codec_data` (the section the C keeps behind `FIXME: parse
+initial section`) and reads the style/margin fields off each row.
+
+**Mapping.** The dialogue's style becomes the IR base
+(font/size/colors/bold/italic/underline/strikeout/scale/spacing, outline and
+shadow, `BorderStyle=3` as a cue-background box in the outline colour) and
+layout (numpad alignment → anchor + text align, margins). Override tags
+become per-span styling: `\i \b \u \s` (empty arg = reset to style), `\fn
+\fs \fsp \fscx \fscy`, `\c \1c \3c \4c`, `\alpha \1a \3a \4a` (inverted SSA
+alpha converted), `\bord \shad \xshad \yshad`, `\an`/`\a` and `\pos`/`\move`
+(first wins, like VSFilter), `\r`/`\rName`, karaoke `\k \K \kf \ko`
+(cumulative centiseconds → `Span::reveal_ns`, absolute on the cue timeline),
+and `\p` drawing mode (the path commands are dropped). `\t(...)` arguments
+are consumed whole so animated tags never leak out statically; `\fad \fade
+\clip \org \fr* \be \blur \q \fe \2c \2a` and unknown tags are consumed and
+ignored.
+
+**Units.** Positions, margins and font sizes are normalised out of `PlayRes`
+space into frame percentages (`PlayRes` defaulting per the usual rules:
+384x288 when absent, 4:3-derived when only one axis is given); font sizes use
+`FontSize::FrameHeightPercent`. Outline widths, shadow offsets and letter
+spacing land on the IR's point-denominated fields as `1px ≈ 1pt` — an
+approximation that keeps proportions.
+
+**Line breaks.** The IR gets clean line breaks for `\N`/`\n` and a no-break
+space for `\h`; the C's `" \n"` / two-space quirks are preserved only in the
+pango-markup text.
+
 ## Notes / deviations
 
 - The C `ssaparse` element is per-line and relies on the container for timing.
