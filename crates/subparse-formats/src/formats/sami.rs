@@ -145,6 +145,7 @@ impl SamiContext {
                 end_ns,
                 text,
                 settings: CueSettings::default(),
+                id: None,
             });
         }
         None

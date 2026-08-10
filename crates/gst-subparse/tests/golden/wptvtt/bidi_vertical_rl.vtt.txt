@@ -1,0 +1,10 @@
+cue 0: 0.000 +5.000
+  pango: "<ruby>右<rt>みぎ</rt></ruby>に<ruby> 見<rt>み</rt></ruby>えるのは...\n二行目"
+  text: "右に 見えるのは...\n二行目"
+  layout: vertical-rl
+  line:
+    span "右" ruby="みぎ"/over
+    span "に 見" ruby="み"/over
+    span "えるのは..."
+  line:
+    span "二行目"

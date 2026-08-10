@@ -481,7 +481,7 @@ impl SsaParse {
             let (text, cue_ir) = if ir_mode {
                 // The whole-file parser emits pango-markup flavoured text
                 // (escaped plain text today, see `formats::ssa`).
-                let cue_ir = ir::cue_to_ir(cue, subparse_formats::OutputFormat::PangoMarkup);
+                let cue_ir = ir::cue_to_ir(cue, subparse_formats::OutputFormat::PangoMarkup, None);
                 (cue_ir.plain_text(), Some(cue_ir))
             } else {
                 (cue.text.trim_end_matches(['\n', '\r']).to_owned(), None)

@@ -18,6 +18,7 @@
 
 use crate::cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};
 use crate::format::{LineScanner, Parsed, SubtitleFormat};
+use crate::vttcss::Stylesheet;
 
 const GST_SECOND: u64 = 1_000_000_000;
 const GST_MSECOND: u64 = 1_000_000;
@@ -66,15 +67,24 @@ impl SubtitleFormat for WebVtt {
     fn output_format(&self) -> OutputFormat {
         OutputFormat::PangoMarkup
     }
+
+    fn stylesheet(&self) -> Option<&Stylesheet> {
+        (!self.machine.sheet.is_empty()).then_some(&self.machine.sheet)
+    }
 }
 
 /// State of the line-oriented machine, mirroring the C `ParserState.state`.
 /// The C uses states 0/1 (both "seek the timing line") and 2 ("collect text").
-/// We collapse 0/1 into `SeekTiming`.
+/// We collapse 0/1 into `SeekTiming`. `CollectStyle` is ours alone: the C
+/// ignores `STYLE` blocks, and since it also ignores every other non-timing
+/// line while seeking, collecting them on the side cannot change which cues
+/// come out (a timing line inside a style block is handed back, see
+/// [`Machine::feed`]).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum St {
     #[default]
     SeekTiming,
+    CollectStyle,
     CollectText,
 }
 
@@ -93,6 +103,22 @@ struct Machine {
     /// a clamped copy (see `Cue`'s `end_ns >= start_ns` invariant).
     cur_end: u64,
     cur_settings: CueSettings,
+    /// The identifier of the cue being collected (the line immediately
+    /// preceding its timing line).
+    cur_id: Option<String>,
+    /// Candidate identifier: the last non-blank, non-timing line seen while
+    /// seeking. A blank line resets it (the id line must immediately precede
+    /// the timing line).
+    pending_id: Option<String>,
+    /// Whether a timing line has been accepted yet. Per the spec, `STYLE`
+    /// blocks are only valid before the first cue; later ones are ignored
+    /// (WPT `embedded_style_invalid_format.vtt` pins this).
+    saw_cue: bool,
+    /// CSS text of the `STYLE` block being collected.
+    style_buf: String,
+    /// Rules of every completed `STYLE` block. Exposed via
+    /// [`SubtitleFormat::stylesheet`]; only the `cue-ir` output path reads it.
+    sheet: Stylesheet,
     buf: String,
 }
 
@@ -100,21 +126,20 @@ impl Machine {
     /// Feed one line (terminator and any `\r` already removed).
     fn feed(&mut self, line: &str, cues: &mut Vec<Cue>) {
         match self.state {
-            St::SeekTiming => {
-                if let Some((ts_start, ts_end, settings)) = parse_timing_line(line)
-                    && self.prev_end <= ts_end
-                {
-                    self.cur_start = ts_start;
-                    self.cur_end = ts_end;
-                    self.cur_settings = match settings {
-                        Some(s) => parse_cue_settings(s),
-                        None => CueSettings::default(),
-                    };
-                    self.buf.clear();
-                    self.state = St::CollectText;
+            St::SeekTiming => self.feed_seek(line),
+            St::CollectStyle => {
+                if line.is_empty() {
+                    self.end_style_block();
+                } else if line.contains("-->") {
+                    // A timing line terminates an unfinished style block and
+                    // starts its cue (the spec's "collect a WebVTT block"
+                    // does the same).
+                    self.end_style_block();
+                    self.feed_seek(line);
+                } else {
+                    self.style_buf.push_str(line);
+                    self.style_buf.push('\n');
                 }
-                // Otherwise not a timing line (cue id, `WEBVTT` header, `NOTE`,
-                // blank line, etc.). Ignored while seeking, exactly like the C.
             }
             St::CollectText => {
                 if !self.buf.is_empty() {
@@ -131,6 +156,7 @@ impl Machine {
                     let mut cue =
                         Cue::new(self.cur_start, Some(self.cur_end.max(self.cur_start)), text);
                     cue.settings = std::mem::take(&mut self.cur_settings);
+                    cue.id = self.cur_id.take();
                     cues.push(cue);
                     self.prev_end = self.cur_end; // element: start_time += duration
                     self.buf.clear();
@@ -138,6 +164,50 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// One line in the seeking state.
+    fn feed_seek(&mut self, line: &str) {
+        if let Some((ts_start, ts_end, settings)) = parse_timing_line(line)
+            && self.prev_end <= ts_end
+        {
+            self.cur_start = ts_start;
+            self.cur_end = ts_end;
+            self.cur_settings = match settings {
+                Some(s) => parse_cue_settings(s),
+                None => CueSettings::default(),
+            };
+            self.cur_id = self.pending_id.take();
+            self.saw_cue = true;
+            self.buf.clear();
+            self.state = St::CollectText;
+        } else if !self.saw_cue && line == "STYLE" {
+            // Spec: the block starts with a line that is exactly "STYLE"
+            // (case-sensitive), before the first cue. The C ignores these
+            // lines like any other non-timing line, so collecting them is
+            // parity-neutral for the cue stream.
+            self.style_buf.clear();
+            self.pending_id = None;
+            self.state = St::CollectStyle;
+        } else {
+            // Not a timing line (cue id, `WEBVTT` header, `NOTE`, blank line,
+            // rejected timing, ...). Ignored while seeking, exactly like the
+            // C; remembered as the candidate cue identifier when it could be
+            // one.
+            self.pending_id = if line.is_empty() || line.contains("-->") {
+                None
+            } else {
+                Some(line.to_owned())
+            };
+        }
+    }
+
+    fn end_style_block(&mut self) {
+        if !self.style_buf.is_empty() {
+            self.sheet.push_css(&self.style_buf);
+            self.style_buf.clear();
+        }
+        self.state = St::SeekTiming;
     }
 }
 
@@ -290,11 +360,14 @@ fn is_scanf_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }
 
-/// Port of `parse_webvtt_cue_settings`. Fills the fields exposed by
-/// [`CueSettings`]. The C also keeps a signed `line_number` for the `L:<n>`
-/// (no `%`) form. [`CueSettings`] has no such field, so that form is recognised
-/// but not stored. The upstream element parses these settings and then
-/// **discards** them (they never reach output). We surface them instead.
+/// Port of `parse_webvtt_cue_settings`, extended with the modern syntax.
+///
+/// The C only understands the archaic one-letter forms (`T:`/`S:`/`L:`/`D:`/
+/// `A:`); the modern `name:value` settings every current WebVTT file uses
+/// (`align:center position:50%`) fall through its `switch` unrecognised. The
+/// upstream element parses what it does recognise and then **discards** it
+/// (settings never reach the output), so surfacing both syntaxes on
+/// [`CueSettings`] is richer, not a parity break.
 fn parse_cue_settings(settings: &str) -> CueSettings {
     let mut cs = CueSettings::default();
 
@@ -302,6 +375,62 @@ fn parse_cue_settings(settings: &str) -> CueSettings {
         let Some(&first) = tok.as_bytes().first() else {
             continue; // empty token (consecutive separators)
         };
+        // Modern `name:value` settings. The names are lowercase words, so
+        // they can never collide with the uppercase one-letter C forms.
+        if let Some((key, value)) = tok.split_once(':')
+            && !value.is_empty()
+        {
+            match key {
+                "line" => {
+                    // `line:10%[,align]` or `line:<int>[,align]`.
+                    let (value, align) = match value.split_once(',') {
+                        Some((v, a)) => (v, Some(a)),
+                        None => (value, None),
+                    };
+                    if let Some(pct) = value.strip_suffix('%') {
+                        if let Some(v) = parse_percent(pct) {
+                            cs.line_position = Some(v);
+                        }
+                    } else if let Ok(v) = value.parse::<i32>() {
+                        cs.line_number = Some(v);
+                    }
+                    if let Some(a) = align.filter(|a| !a.is_empty()) {
+                        cs.line_align = Some(a.to_string());
+                    }
+                    continue;
+                }
+                "position" => {
+                    let (value, align) = match value.split_once(',') {
+                        Some((v, a)) => (v, Some(a)),
+                        None => (value, None),
+                    };
+                    if let Some(v) = value.strip_suffix('%').and_then(parse_percent) {
+                        cs.text_position = Some(v);
+                    }
+                    if let Some(a) = align.filter(|a| !a.is_empty()) {
+                        cs.position_align = Some(a.to_string());
+                    }
+                    continue;
+                }
+                "size" => {
+                    if let Some(v) = value.strip_suffix('%').and_then(parse_percent) {
+                        cs.text_size = Some(v);
+                    }
+                    continue;
+                }
+                "align" => {
+                    cs.alignment = Some(value.to_string());
+                    continue;
+                }
+                "vertical" => {
+                    cs.vertical = Some(value.to_string());
+                    continue;
+                }
+                // `region:` needs region blocks, which nothing here models.
+                "region" => continue,
+                _ => {} // fall through to the one-letter C forms
+            }
+        }
         match first {
             b'T' => {
                 if let Some(v) = scan_short_after(tok, "T:") {
@@ -334,6 +463,13 @@ fn parse_cue_settings(settings: &str) -> CueSettings {
     }
 
     cs
+}
+
+/// A modern-syntax percentage: a non-negative number in `[0, 100]`, rounded
+/// to the `u8` the settings fields hold.
+fn parse_percent(s: &str) -> Option<u8> {
+    let v = s.parse::<f32>().ok()?;
+    (v.is_finite() && (0.0..=100.0).contains(&v)).then(|| v.round() as u8)
 }
 
 /// Mimic sscanf `"<prefix>%hd"`. Require the literal prefix, then read an
@@ -998,6 +1134,175 @@ mod tests {
     fn settings_absent_are_all_none() {
         let cs = settings_of("00:00:01.000 --> 00:00:02.000\nOne\n\n");
         assert_eq!(cs, CueSettings::default());
+    }
+
+    // ---- Modern (name:value) cue settings ----------------------------------
+
+    #[test]
+    fn modern_settings_are_parsed() {
+        let cs = settings_of(
+            "00:00:01.000 --> 00:00:02.000 align:center position:50%,line-left size:35% line:10%,end vertical:rl\nOne\n\n",
+        );
+        assert_eq!(cs.alignment.as_deref(), Some("center"));
+        assert_eq!(cs.text_position, Some(50));
+        assert_eq!(cs.position_align.as_deref(), Some("line-left"));
+        assert_eq!(cs.text_size, Some(35));
+        assert_eq!(cs.line_position, Some(10));
+        assert_eq!(cs.line_align.as_deref(), Some("end"));
+        assert_eq!(cs.vertical.as_deref(), Some("rl"));
+    }
+
+    #[test]
+    fn modern_line_number_form() {
+        let cs = settings_of("00:00:01.000 --> 00:00:02.000 line:-1\nOne\n\n");
+        assert_eq!(cs.line_number, Some(-1));
+        assert_eq!(cs.line_position, None);
+        let cs = settings_of("00:00:01.000 --> 00:00:02.000 line:3,start\nOne\n\n");
+        assert_eq!(cs.line_number, Some(3));
+        assert_eq!(cs.line_align.as_deref(), Some("start"));
+    }
+
+    #[test]
+    fn modern_settings_do_not_change_cue_text_or_timing() {
+        // Parity: the C drops every setting; text/timing must be identical.
+        assert_cue(
+            "1\n00:00:01.000 --> 00:00:02.000 align:center position:50%\nOne\n\n",
+            S,
+            2 * S,
+            "One",
+        );
+    }
+
+    #[test]
+    fn modern_percent_values_are_validated() {
+        // Out-of-range or junk percentages are dropped, not wrapped.
+        let cs = settings_of("00:00:01.000 --> 00:00:02.000 position:150% size:abc%\nOne\n\n");
+        assert_eq!(cs.text_position, None);
+        assert_eq!(cs.text_size, None);
+    }
+
+    #[test]
+    fn old_single_letter_forms_still_parse() {
+        // The archaic syntax keeps working alongside the modern one.
+        let cs = settings_of("00:00:01.000 --> 00:00:02.000 T:50% align:end\nOne\n\n");
+        assert_eq!(cs.text_position, Some(50));
+        assert_eq!(cs.alignment.as_deref(), Some("end"));
+    }
+
+    // ---- STYLE blocks and cue identifiers ---------------------------------
+
+    /// Parse a whole body and hand back the cues plus the parser (for its
+    /// stylesheet).
+    fn parse_keeping_parser(body: &str) -> (Vec<Cue>, WebVtt) {
+        let mut p = WebVtt::default();
+        let cues = p.parse(body, &ParseContext::default()).unwrap();
+        (cues, p)
+    }
+
+    #[test]
+    fn style_block_is_collected_and_cues_are_untouched() {
+        let body = "WEBVTT\n\nSTYLE\n::cue { color: lime }\n\n00:00:01.000 --> 00:00:02.000\n<i>Hi</i>\n\n";
+        let (cues, p) = parse_keeping_parser(body);
+        assert_eq!(cues.len(), 1);
+        // Parity: text and timing exactly as without the STYLE block.
+        assert_eq!(cues[0].text, "<i>Hi</i>");
+        assert_eq!(cues[0].start_ns, S);
+        let sheet = p.stylesheet().expect("stylesheet collected");
+        assert_eq!(sheet.rules().len(), 1);
+    }
+
+    #[test]
+    fn multiple_style_blocks_accumulate() {
+        // WPT embedded_style_cascade_priority.vtt: both blocks apply.
+        let body = "WEBVTT\n\nSTYLE\n::cue { color: green }\n\nSTYLE\n::cue { background: green }\n\n00:00:01.000 --> 00:00:02.000\nOne\n\n";
+        let (_, p) = parse_keeping_parser(body);
+        assert_eq!(p.stylesheet().unwrap().rules().len(), 2);
+    }
+
+    #[test]
+    fn style_lines_must_match_exactly_and_precede_cues() {
+        // WPT embedded_style_invalid_format.vtt distillate: none of these
+        // start a style block.
+        for bad in ["STYLE Invalid", " STYLE", "style", "S T Y L E", "STYLE {"] {
+            let body = format!(
+                "WEBVTT\n\n{bad}\n::cue {{ color: red }}\n\n00:00:01.000 --> 00:00:02.000\nOne\n\n"
+            );
+            let (cues, p) = parse_keeping_parser(&body);
+            assert_eq!(cues.len(), 1, "{bad:?} must not eat the cue");
+            assert!(p.stylesheet().is_none(), "{bad:?} must not collect CSS");
+        }
+        // A STYLE block after the first cue is ignored (spec).
+        let body = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nOne\n\nSTYLE\n::cue { color: red }\n\n00:00:03.000 --> 00:00:04.000\nTwo\n\n";
+        let (cues, p) = parse_keeping_parser(body);
+        assert_eq!(cues.len(), 2);
+        assert!(p.stylesheet().is_none());
+    }
+
+    #[test]
+    fn timing_line_terminates_a_style_block() {
+        // Spec: a "-->" line ends the block and starts its cue.
+        let body = "WEBVTT\n\nSTYLE\n::cue { color: lime }\n00:00:01.000 --> 00:00:02.000\nOne\n\n";
+        let (cues, p) = parse_keeping_parser(body);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "One");
+        assert_eq!(p.stylesheet().unwrap().rules().len(), 1);
+    }
+
+    #[test]
+    fn empty_style_block_collects_nothing() {
+        // "STYLE" followed by a blank line: the block ends empty, and the
+        // CSS-looking lines after it are ordinary ignored seek lines.
+        let body =
+            "WEBVTT\n\nSTYLE\n\n::cue { color: red }\n\n00:00:01.000 --> 00:00:02.000\nOne\n\n";
+        let (cues, p) = parse_keeping_parser(body);
+        assert_eq!(cues.len(), 1);
+        assert!(p.stylesheet().is_none());
+    }
+
+    #[test]
+    fn cue_identifier_is_captured() {
+        let cues = parse(&vtt(
+            "greeting\n00:00:01.000 --> 00:00:02.000\nHi\n\n00:00:03.000 --> 00:00:04.000\nAnon\n\n",
+        ));
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].id.as_deref(), Some("greeting"));
+        // No id line for the second cue; the blank separator reset it.
+        assert_eq!(cues[1].id, None);
+    }
+
+    #[test]
+    fn note_line_directly_before_timing_becomes_the_id() {
+        // The id is the immediately preceding non-blank line; a NOTE block
+        // separated by a blank line is not.
+        let cues = parse(&vtt(
+            "NOTE a comment\n\n00:00:01.000 --> 00:00:02.000\nOne\n\n",
+        ));
+        assert_eq!(cues[0].id, None);
+    }
+
+    #[test]
+    fn stylesheet_survives_incremental_chunking() {
+        let body = "WEBVTT\n\nSTYLE\n::cue(b) { color: red }\n\n00:00:01.000 --> 00:00:02.000\n<b>One</b>\n\n";
+        // Feed one byte at a time through the streaming contract.
+        let mut p = WebVtt::default();
+        let mut buf = String::new();
+        let mut cues = Vec::new();
+        for (i, ch) in body.char_indices() {
+            buf.push_str(&body[i..i + ch.len_utf8()]);
+            let parsed = p
+                .parse_incremental(&buf, &ParseContext::default(), false)
+                .unwrap();
+            cues.extend(parsed.cues);
+            buf.drain(..parsed.consumed);
+        }
+        let parsed = p
+            .parse_incremental(&buf, &ParseContext::default(), true)
+            .unwrap();
+        cues.extend(parsed.cues);
+
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "<b>One</b>");
+        assert_eq!(p.stylesheet().unwrap().rules().len(), 1);
     }
 
     // ---- Timestamp edge cases --------------------------------------------

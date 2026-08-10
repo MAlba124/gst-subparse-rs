@@ -1,0 +1,6 @@
+cue 0: 0.000 +0.100
+  pango: "Test Text"
+  text: "Test Text"
+  layout: size=40
+  line:
+    span "Test Text"

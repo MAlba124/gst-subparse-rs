@@ -1,0 +1,6 @@
+cue 0: 0.000 +5.000
+  pango: "This is a <v foo>test subtitle</v>"
+  text: "This is a test subtitle"
+  line:
+    span "This is a "
+    span "test subtitle" voice="foo"

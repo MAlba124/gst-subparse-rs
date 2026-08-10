@@ -24,18 +24,21 @@
 //!   frame in `[0, 100]`, so the renderer needs no knowledge of the source
 //!   format's coordinate space.
 //!
-//! Two constructors cover everything the parsers emit today:
+//! The constructors cover everything the parsers emit today:
 //! [`CueIr::from_pango_markup`] understands the (closed) markup subset the
 //! `subparse-formats` parsers generate — `<i>/<b>/<u>` (SubRip, MPL2),
 //! `<span>` with `foreground`/`font_family`/`size`/`rise` (SAMI),
 //! `style`/`weight`/`size` (MicroDVD), `font`/`color`/`bgcolor` (QTtext) — as
 //! well as the WebVTT tags the C keeps verbatim (`<c>`, `<v>`, `<ruby>`,
-//! `<rt>`). [`CueIr::from_plain_text`] wraps unstyled text. [`cue_to_ir`]
+//! `<rt>`). [`CueIr::from_pango_markup_styled`] additionally applies a WebVTT
+//! [`Stylesheet`] (`STYLE` blocks, see [`crate::vttcss`]) with CSS cascade
+//! semantics. [`CueIr::from_plain_text`] wraps unstyled text. [`cue_to_ir`]
 //! picks between them and folds the cue's [`CueSettings`] into the layout.
 //!
 //! Like the rest of this crate, the module is dependency-free (std only).
 
 use crate::cue::{Cue, CueSettings, OutputFormat};
+use crate::vttcss::Stylesheet;
 
 // -- colors ------------------------------------------------------------------
 
@@ -252,7 +255,7 @@ const NAMED_COLORS: &[(&str, u32)] = &[
     ("yellowgreen", 0x9acd32),
 ];
 
-fn named_color(name: &str) -> Option<Color> {
+pub(crate) fn named_color(name: &str) -> Option<Color> {
     let lower = name.to_ascii_lowercase();
     NAMED_COLORS
         .binary_search_by(|(n, _)| n.cmp(&lower.as_str()))
@@ -559,17 +562,36 @@ impl CueIr {
     /// styled spans. Lenient: unknown tags are dropped (their content kept),
     /// unclosed tags close at the end of the cue, stray closers are ignored.
     pub fn from_pango_markup(markup: &str) -> CueIr {
-        markup::parse(markup)
+        markup::parse(markup, None, None)
+    }
+
+    /// Like [`CueIr::from_pango_markup`], additionally applying a WebVTT
+    /// [`Stylesheet`] (from the file's `STYLE` blocks). `::cue` rules land in
+    /// [`CueIr::base`]; `::cue(...)` rules are matched against each tag as it
+    /// opens, with the author CSS overriding the tag-derived styling, and
+    /// deeper tags overriding inherited values — CSS cascade semantics.
+    /// `cue_id` is the cue's identifier, for `::cue(#id)` selectors.
+    pub fn from_pango_markup_styled(
+        markup: &str,
+        sheet: Option<&Stylesheet>,
+        cue_id: Option<&str>,
+    ) -> CueIr {
+        markup::parse(markup, sheet, cue_id)
     }
 }
 
 /// Build the IR for one parsed [`Cue`], honouring the flavour `output` says
 /// its text is in and folding its WebVTT [`CueSettings`] into the layout.
-pub fn cue_to_ir(cue: &Cue, output: OutputFormat) -> CueIr {
+/// `sheet` is the WebVTT stylesheet collected from the stream's `STYLE`
+/// blocks ([`crate::format::SubtitleFormat::stylesheet`]); `None` for formats
+/// without one.
+pub fn cue_to_ir(cue: &Cue, output: OutputFormat, sheet: Option<&Stylesheet>) -> CueIr {
     let text = cue.text.trim_end_matches(['\n', '\r']);
     let mut ir = match output {
         OutputFormat::Utf8 => CueIr::from_plain_text(text),
-        OutputFormat::PangoMarkup => CueIr::from_pango_markup(text),
+        OutputFormat::PangoMarkup => {
+            CueIr::from_pango_markup_styled(text, sheet, cue.id.as_deref())
+        }
     };
     apply_settings(&mut ir.layout, &cue.settings);
     ir
@@ -579,17 +601,38 @@ pub fn cue_to_ir(cue: &Cue, output: OutputFormat) -> CueIr {
 fn apply_settings(layout: &mut Layout, s: &CueSettings) {
     if let Some(v) = s.line_position {
         layout.line = Some(LinePosition::Percent(v as f32));
+    } else if let Some(n) = s.line_number {
+        layout.line = Some(LinePosition::Line(n));
+    }
+    if let Some(a) = s.line_align.as_deref() {
+        layout.line_align = match a {
+            "start" => Some(LineAlign::Start),
+            "center" => Some(LineAlign::Center),
+            "end" => Some(LineAlign::End),
+            _ => layout.line_align,
+        };
     }
     if let Some(v) = s.text_position {
         layout.position = Some(v as f32);
+    }
+    if let Some(a) = s.position_align.as_deref() {
+        layout.position_align = match a {
+            "line-left" => Some(PositionAlign::LineLeft),
+            "center" => Some(PositionAlign::Center),
+            "line-right" => Some(PositionAlign::LineRight),
+            "auto" => Some(PositionAlign::Auto),
+            _ => layout.position_align,
+        };
     }
     if let Some(v) = s.text_size {
         layout.size = Some(v as f32);
     }
     if let Some(v) = s.vertical.as_deref() {
         layout.writing_mode = match v {
-            "vertical" => WritingMode::VerticalRl,
-            "vertical-lr" => WritingMode::VerticalLr,
+            // Old syntax (`D:vertical`) on the left, modern (`vertical:rl`)
+            // on the right.
+            "vertical" | "rl" => WritingMode::VerticalRl,
+            "vertical-lr" | "lr" => WritingMode::VerticalLr,
             _ => WritingMode::HorizontalTb,
         };
     }
@@ -609,6 +652,7 @@ fn apply_settings(layout: &mut Layout, s: &CueSettings) {
 
 mod markup {
     use super::*;
+    use crate::vttcss::Node;
 
     /// The parse state that tags push/pop.
     #[derive(Debug, Clone, Default)]
@@ -616,13 +660,16 @@ mod markup {
         style: SpanStyle,
         voice: Option<String>,
         classes: Vec<String>,
+        /// Where a ruby annotation closing in this context is drawn
+        /// (CSS `ruby-position`, inherited).
+        ruby_position: RubyPosition,
         /// Inside `<ruby>`.
         in_ruby: bool,
         /// Inside `<rt>` (text goes to the annotation, not the line).
         in_rt: bool,
     }
 
-    struct Parser {
+    struct Parser<'a> {
         lines: Vec<Line>,
         cur_line: Vec<Span>,
         cur_text: String,
@@ -631,16 +678,40 @@ mod markup {
         stack: Vec<(String, Ctx)>,
         /// Annotation text accumulating inside `<rt>`.
         rt_text: String,
+        /// WebVTT `STYLE` rules to apply as tags open (`None` = no styling).
+        sheet: Option<&'a Stylesheet>,
+        /// Cue-wide style: `::cue` and `::cue(#id)` rules land here.
+        base: SpanStyle,
     }
 
-    pub(super) fn parse(input: &str) -> CueIr {
+    pub(super) fn parse(input: &str, sheet: Option<&Stylesheet>, cue_id: Option<&str>) -> CueIr {
+        let sheet = sheet.filter(|s| !s.is_empty());
+
+        // Rules matching the cue root apply to the whole cue: the argless
+        // `::cue`, `::cue(#id)` and `::cue(*)`. They become the IR's base
+        // style, which spans inherit where their own fields stay `None`.
+        let mut base = SpanStyle::default();
+        let mut root_ruby = RubyPosition::default();
+        if let Some(sheet) = sheet {
+            let root = Node {
+                id: cue_id,
+                ..Node::default()
+            };
+            sheet.apply(&root, &mut base, &mut root_ruby);
+        }
+
         let mut p = Parser {
             lines: Vec::new(),
             cur_line: Vec::new(),
             cur_text: String::new(),
-            ctx: Ctx::default(),
+            ctx: Ctx {
+                ruby_position: root_ruby,
+                ..Ctx::default()
+            },
             stack: Vec::new(),
             rt_text: String::new(),
+            sheet,
+            base,
         };
 
         let bytes = input.as_bytes();
@@ -717,7 +788,7 @@ mod markup {
         }
     }
 
-    impl Parser {
+    impl Parser<'_> {
         fn text(&mut self, s: &str) {
             if self.ctx.in_rt {
                 self.rt_text.push_str(s);
@@ -779,6 +850,7 @@ mod markup {
             }
             CueIr {
                 lines: self.lines,
+                base: self.base,
                 ..CueIr::default()
             }
         }
@@ -803,6 +875,19 @@ mod markup {
             // The state change happens between spans by definition.
             self.flush();
             let saved = self.ctx.clone();
+
+            // Any WebVTT tag may carry `.class`es after its name; what follows
+            // the first whitespace is the annotation (`<v.quiet Fred>`).
+            let vtt_node = matches!(
+                name.as_str(),
+                "i" | "b" | "u" | "c" | "v" | "ruby" | "rt" | "lang"
+            );
+            let (own_classes, annotation) = if vtt_node {
+                split_tag_rest(rest)
+            } else {
+                (Vec::new(), rest.trim())
+            };
+
             match name.as_str() {
                 "i" => self.ctx.style.font_style = Some(FontStyle::Italic),
                 "b" => self.ctx.style.font_weight = Some(700),
@@ -815,18 +900,16 @@ mod markup {
                 "sup" => self.ctx.style.baseline_shift = Some(3.0),
                 "span" => self.apply_span_attrs(rest),
                 "v" => {
-                    // WebVTT voice: the annotation is everything after the
-                    // name, e.g. `<v Fred>`.
-                    let annotation = rest.trim();
+                    // WebVTT voice: the annotation is the speaker, e.g.
+                    // `<v Fred>`.
                     if !annotation.is_empty() {
                         self.ctx.voice = Some(annotation.to_owned());
                     }
                 }
-                "c" => self.apply_vtt_classes(rest),
+                "c" => {}
                 "lang" => {
-                    let l = rest.trim();
-                    if !l.is_empty() {
-                        self.ctx.style.language = Some(l.to_owned());
+                    if !annotation.is_empty() {
+                        self.ctx.style.language = Some(annotation.to_owned());
                     }
                 }
                 "ruby" => self.ctx.in_ruby = true,
@@ -836,6 +919,42 @@ mod markup {
                 // Unknown tag: keep the content, drop the styling.
                 _ => {}
             }
+
+            // The standard WebVTT color classes style whatever tag carries
+            // them (browsers match them via `::cue(.white)` UA rules); every
+            // class is also recorded verbatim on the span.
+            for class in &own_classes {
+                if let Some(bg) = class.strip_prefix("bg_") {
+                    if let Some(c) = vtt_class_color(bg) {
+                        self.ctx.style.background = Some(c);
+                    }
+                } else if let Some(c) = vtt_class_color(class) {
+                    self.ctx.style.foreground = Some(c);
+                }
+                self.ctx.classes.push(class.clone());
+            }
+
+            // Author CSS for this node, over the tag-derived (UA-level)
+            // styling. Descendant tags then layer their own styling on top,
+            // which is exactly CSS inheritance: a value specified on the
+            // node beats one inherited from an ancestor.
+            if vtt_node && let Some(sheet) = self.sheet {
+                let voice = if name == "v" {
+                    self.ctx.voice.clone()
+                } else {
+                    None
+                };
+                let lang = self.ctx.style.language.clone();
+                let node = Node {
+                    element: Some(name.as_str()),
+                    classes: &own_classes,
+                    voice: voice.as_deref(),
+                    lang: lang.as_deref(),
+                    id: None,
+                };
+                sheet.apply(&node, &mut self.ctx.style, &mut self.ctx.ruby_position);
+            }
+
             self.stack.push((name, saved));
         }
 
@@ -861,7 +980,9 @@ mod markup {
                 if !text.is_empty() {
                     let ruby = Ruby {
                         text,
-                        position: RubyPosition::Over,
+                        // The context's (CSS `ruby-position`) placement; the
+                        // <rt>'s own ctx is still current here.
+                        position: self.ctx.ruby_position,
                     };
                     // Annotate the base text: the span just before the <rt>.
                     if let Some(base) = self.cur_line.last_mut() {
@@ -967,21 +1088,25 @@ mod markup {
                 }
             }
         }
+    }
 
-        /// WebVTT class tag: `<c.yellow.bg_blue>`. The standard color classes
-        /// double as styling; every class is also recorded verbatim.
-        fn apply_vtt_classes(&mut self, rest: &str) {
-            for class in rest.trim().split('.').filter(|c| !c.is_empty()) {
-                if let Some(bg) = class.strip_prefix("bg_") {
-                    if let Some(c) = vtt_class_color(bg) {
-                        self.ctx.style.background = Some(c);
-                    }
-                } else if let Some(c) = vtt_class_color(class) {
-                    self.ctx.style.foreground = Some(c);
-                }
-                self.ctx.classes.push(class.to_owned());
-            }
+    /// Split a WebVTT tag's post-name text into its `.class` list and its
+    /// annotation: `.quiet.fast Fred` -> `(["quiet", "fast"], "Fred")`.
+    fn split_tag_rest(rest: &str) -> (Vec<String>, &str) {
+        let rest = rest.trim();
+        if !rest.starts_with('.') {
+            return (Vec::new(), rest);
         }
+        let (class_part, annotation) = match rest.find([' ', '\t']) {
+            Some(at) => (&rest[..at], rest[at + 1..].trim()),
+            None => (rest, ""),
+        };
+        let classes = class_part
+            .split('.')
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (classes, annotation)
     }
 
     /// The leading alphanumeric run of a tag body (`v Fred` -> `v`,
@@ -1356,6 +1481,147 @@ mod tests {
         );
     }
 
+    // ---- webvtt stylesheets (STYLE blocks) --------------------------------------
+
+    fn styled(markup: &str, css: &str) -> CueIr {
+        let sheet = Stylesheet::parse(css);
+        CueIr::from_pango_markup_styled(markup, Some(&sheet), None)
+    }
+
+    #[test]
+    fn argless_cue_rule_becomes_base_style() {
+        let ir = styled(
+            "plain <b>bold</b>",
+            "::cue { color: yellow; background: black }",
+        );
+        assert_eq!(ir.base.foreground, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(ir.base.background, Some(Color::rgb(0, 0, 0)));
+        // Spans keep their own fields None (inheritance is the renderer's).
+        assert_eq!(spans_of(&ir)[0].style.foreground, None);
+    }
+
+    #[test]
+    fn type_rule_styles_matching_tags() {
+        let ir = styled("a<b>bee</b><i>eye</i>", "::cue(b) { color: red }");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, None);
+        assert_eq!(spans[1].style.foreground, Some(Color::rgb(255, 0, 0)));
+        assert_eq!(spans[1].style.font_weight, Some(700));
+        assert_eq!(spans[2].style.foreground, None);
+    }
+
+    #[test]
+    fn author_css_overrides_tag_styling() {
+        let ir = styled("<i>x</i>", "::cue(i) { font-style: normal }");
+        assert_eq!(spans_of(&ir)[0].style.font_style, Some(FontStyle::Normal));
+    }
+
+    #[test]
+    fn author_css_overrides_default_color_classes() {
+        let ir = styled("<c.yellow>x</c>", "::cue(.yellow) { color: #123456 }");
+        let span = &spans_of(&ir)[0];
+        assert_eq!(span.style.foreground, Some(Color::rgb(0x12, 0x34, 0x56)));
+        assert_eq!(span.classes, vec!["yellow"]);
+    }
+
+    #[test]
+    fn voice_rule_matches_annotation() {
+        let ir = styled(
+            "<v Fred>hi</v><v Wilma>ho</v>",
+            "::cue(v[voice=\"Fred\"]) { color: red }",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, Some(Color::rgb(255, 0, 0)));
+        assert_eq!(spans[1].style.foreground, None);
+    }
+
+    #[test]
+    fn classes_and_annotation_split_on_any_tag() {
+        // `<v.loud Fred>`: classes before the space, the voice after it.
+        let ir = styled("<v.loud Fred>hi", "::cue(.loud) { color: red }");
+        let span = &spans_of(&ir)[0];
+        assert_eq!(span.voice.as_deref(), Some("Fred"));
+        assert_eq!(span.classes, vec!["loud"]);
+        assert_eq!(span.style.foreground, Some(Color::rgb(255, 0, 0)));
+        // `<b.loud>` records its classes too (previously only <c> did).
+        let ir = CueIr::from_pango_markup("<b.loud>x</b>");
+        assert_eq!(spans_of(&ir)[0].classes, vec!["loud"]);
+    }
+
+    #[test]
+    fn descendant_tag_styling_beats_inherited_author_value() {
+        // CSS: a value specified on the node (the UA italic on <i>) wins over
+        // one inherited from an ancestor's author rule.
+        let ir = styled("<v Fred><i>x</i></v>", "::cue(v) { font-style: normal }");
+        assert_eq!(spans_of(&ir)[0].style.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn deeper_author_rule_beats_shallower_one() {
+        let ir = styled(
+            "<v Fred><c>x</c></v>",
+            "::cue(v) { color: blue } ::cue(c) { color: red }",
+        );
+        assert_eq!(
+            spans_of(&ir)[0].style.foreground,
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn id_rule_matches_cue_identifier() {
+        let sheet = Stylesheet::parse("::cue(#intro) { color: red }");
+        let ir = CueIr::from_pango_markup_styled("x", Some(&sheet), Some("intro"));
+        assert_eq!(ir.base.foreground, Some(Color::rgb(255, 0, 0)));
+        let ir = CueIr::from_pango_markup_styled("x", Some(&sheet), Some("outro"));
+        assert_eq!(ir.base.foreground, None);
+    }
+
+    #[test]
+    fn lang_rule_matches_lang_tags() {
+        let ir = styled(
+            "<lang en-GB>tea</lang><lang fr>café</lang>",
+            "::cue(:lang(en)) { color: red }",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, Some(Color::rgb(255, 0, 0)));
+        assert_eq!(spans[0].style.language.as_deref(), Some("en-GB"));
+        assert_eq!(spans[1].style.foreground, None);
+    }
+
+    #[test]
+    fn ruby_position_rule_moves_annotation() {
+        let ir = styled(
+            "<ruby>base<rt>anno</rt></ruby>",
+            "::cue(rt) { ruby-position: under }",
+        );
+        let span = &spans_of(&ir)[0];
+        assert_eq!(
+            span.ruby,
+            Some(Ruby {
+                text: "anno".to_owned(),
+                position: RubyPosition::Under
+            })
+        );
+    }
+
+    #[test]
+    fn cue_to_ir_feeds_id_and_sheet() {
+        let sheet = Stylesheet::parse("::cue(#greeting) { color: lime }");
+        let mut cue = Cue::new(0, Some(1), "hello");
+        cue.id = Some("greeting".to_owned());
+        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, Some(&sheet));
+        assert_eq!(ir.base.foreground, Some(Color::rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn empty_sheet_changes_nothing() {
+        let sheet = Stylesheet::parse("");
+        let with = CueIr::from_pango_markup_styled("<i>x</i>", Some(&sheet), None);
+        let without = CueIr::from_pango_markup("<i>x</i>");
+        assert_eq!(with, without);
+    }
+
     // ---- cue settings ------------------------------------------------------------
 
     #[test]
@@ -1370,9 +1636,11 @@ mod tests {
                 text_size: Some(35),
                 vertical: Some("vertical-lr".to_owned()),
                 alignment: Some("middle".to_owned()),
+                ..CueSettings::default()
             },
+            id: None,
         };
-        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup);
+        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
         assert_eq!(ir.layout.line, Some(LinePosition::Percent(10.0)));
         assert_eq!(ir.layout.position, Some(50.0));
         assert_eq!(ir.layout.size, Some(35.0));
@@ -1381,9 +1649,35 @@ mod tests {
     }
 
     #[test]
+    fn modern_cue_settings_fold_into_layout() {
+        let cue = Cue {
+            start_ns: 0,
+            end_ns: Some(1),
+            text: "x".to_owned(),
+            settings: CueSettings {
+                line_number: Some(-1),
+                line_align: Some("end".to_owned()),
+                text_position: Some(50),
+                position_align: Some("line-left".to_owned()),
+                vertical: Some("rl".to_owned()),
+                alignment: Some("center".to_owned()),
+                ..CueSettings::default()
+            },
+            id: None,
+        };
+        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
+        assert_eq!(ir.layout.line, Some(LinePosition::Line(-1)));
+        assert_eq!(ir.layout.line_align, Some(LineAlign::End));
+        assert_eq!(ir.layout.position, Some(50.0));
+        assert_eq!(ir.layout.position_align, Some(PositionAlign::LineLeft));
+        assert_eq!(ir.layout.writing_mode, WritingMode::VerticalRl);
+        assert_eq!(ir.layout.align, Some(TextAlign::Center));
+    }
+
+    #[test]
     fn cue_to_ir_trims_trailing_newlines() {
         let cue = Cue::new(0, Some(1), "One\n\n");
-        let ir = cue_to_ir(&cue, OutputFormat::Utf8);
+        let ir = cue_to_ir(&cue, OutputFormat::Utf8, None);
         assert_eq!(ir.lines.len(), 1);
         assert_eq!(ir.plain_text(), "One");
     }

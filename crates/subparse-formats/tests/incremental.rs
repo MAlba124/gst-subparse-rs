@@ -84,6 +84,14 @@ fn fixtures() -> Vec<Fixture> {
                \n\
                NOTE this is a comment\n\
                \n\
+               STYLE\n\
+               ::cue(b) { color: peachpuff }\n\
+               \n\
+               STYLE\n\
+               ::cue { background: rgba(0, 0, 0, 0.8) }\n\
+               00:00:00.500 --> 00:00:00.900\n\
+               Timing line ends the style block\n\
+               \n\
                cue-id-1\n\
                00:00:01.000 --> 00:00:02.000\n\
                Héllo wörld\n\

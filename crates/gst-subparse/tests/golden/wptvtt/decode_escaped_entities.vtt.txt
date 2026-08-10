@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  pango: "Here are the escaped entities: &amp;amp; &amp;lt; &amp;gt; &amp;lrm; &amp;rlm; &amp;nbsp;"
+  text: "Here are the escaped entities: &amp; &lt; &gt; &lrm; &rlm; &nbsp;"
+  line:
+    span "Here are the escaped entities: &amp; &lt; &gt; &lrm; &rlm; &nbsp;"

@@ -567,6 +567,14 @@ impl SubParse {
         let ir_mode = state.ir_mode;
         let output = state.output_format;
         let seg_start = state.segment.start();
+        // The stylesheet the stream has declared so far (WebVTT STYLE
+        // blocks). Only the IR consumes it; pango-markup output ignores
+        // styling exactly like the C.
+        let sheet = if ir_mode {
+            state.parser.as_deref().and_then(|p| p.stylesheet())
+        } else {
+            None
+        };
 
         // Each buffer travels with the position it renders, which is published
         // immediately before it is pushed and not a batch ahead of it.
@@ -585,7 +593,7 @@ impl SubParse {
             // In cue-ir mode the payload is the IR's own plain text, so the
             // buffer text and the meta can never disagree about the content.
             let (text, cue_ir) = if ir_mode {
-                let cue_ir = ir::cue_to_ir(cue, output);
+                let cue_ir = ir::cue_to_ir(cue, output, sheet);
                 (cue_ir.plain_text(), Some(cue_ir))
             } else {
                 let mut text = cue.text.clone();

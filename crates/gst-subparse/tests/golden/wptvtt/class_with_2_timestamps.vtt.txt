@@ -1,0 +1,5 @@
+cue 0: 0.000 +10.000
+  pango: "&lt;00:00.000&gt;<c>This is a </c>&lt;00:05.000&gt;<c>test subtitle</c>"
+  text: "<00:00.000>This is a <00:05.000>test subtitle"
+  line:
+    span "<00:00.000>This is a <00:05.000>test subtitle"

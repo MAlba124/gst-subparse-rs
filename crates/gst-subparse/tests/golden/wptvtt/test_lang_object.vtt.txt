@@ -1,0 +1,5 @@
+cue 0: 0.000 +5.000
+  pango: "DeutschEnglish"
+  text: "DeutschEnglish"
+  line:
+    span "DeutschEnglish"

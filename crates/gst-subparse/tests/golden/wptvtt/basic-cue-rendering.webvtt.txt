@@ -1,0 +1,5 @@
+cue 0: 0.000 +0.100
+  pango: "Test Text"
+  text: "Test Text"
+  line:
+    span "Test Text"

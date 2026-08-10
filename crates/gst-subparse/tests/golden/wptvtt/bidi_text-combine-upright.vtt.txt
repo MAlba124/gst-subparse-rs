@@ -1,0 +1,6 @@
+cue 0: 0.000 +5.000
+  pango: "平成20年4月16日に"
+  text: "平成20年4月16日に"
+  layout: vertical-lr
+  line:
+    span "平成20年4月16日に"

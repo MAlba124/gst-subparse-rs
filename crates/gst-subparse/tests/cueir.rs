@@ -150,6 +150,73 @@ fn subparse_cue_ir_carries_webvtt_settings_and_classes() {
     assert_eq!(span.style.foreground, Some(Color::rgb(0xff, 0xff, 0x00)));
 }
 
+#[test]
+fn subparse_cue_ir_applies_webvtt_style_blocks() {
+    // STYLE-block CSS must reach the IR: ::cue into the base style, selector
+    // rules onto matching spans (overriding the default class colors), and
+    // the cue identifier feeding ::cue(#id).
+    let vtt = "WEBVTT\n\n\
+               STYLE\n\
+               ::cue { background: rgba(0, 0, 0, 0.8) }\n\
+               ::cue(.yellow) { color: #123456 }\n\n\
+               STYLE\n\
+               ::cue(#greeting) { font-style: italic }\n\n\
+               greeting\n\
+               00:00:01.000 --> 00:00:02.000\n\
+               <c.yellow>Hi</c> there\n\n\
+               00:00:03.000 --> 00:00:04.000\n\
+               plain\n\n";
+    init();
+
+    let mut h = gst_check::Harness::new("rssubparse");
+    h.element()
+        .unwrap()
+        .set_property_from_str("text-format", "cue-ir");
+    h.set_src_caps_str("application/x-subtitle-vtt");
+    h.push(gst::Buffer::from_slice(vtt.as_bytes().to_vec()))
+        .expect("push succeeded");
+    h.push_event(gst::event::Eos::new());
+
+    let buffer = h.try_pull().expect("first cue");
+    assert_eq!(text_of(&buffer), "Hi there");
+    let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
+    let ir = meta.ir();
+    // ::cue rules land in the base style; #greeting matched this cue's id.
+    assert_eq!(ir.base.background, Some(Color::rgba(0, 0, 0, 204)));
+    assert_eq!(ir.base.font_style, Some(FontStyle::Italic));
+    // The author rule overrides the default .yellow class color.
+    let span = &ir.lines[0].spans[0];
+    assert_eq!(span.style.foreground, Some(Color::rgb(0x12, 0x34, 0x56)));
+
+    // The second cue has no id: base CSS still applies, #greeting does not.
+    let buffer = h.try_pull().expect("second cue");
+    let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
+    assert_eq!(meta.ir().base.background, Some(Color::rgba(0, 0, 0, 204)));
+    assert_eq!(meta.ir().base.font_style, None);
+}
+
+#[test]
+fn subparse_default_output_ignores_style_blocks() {
+    // Parity: with STYLE blocks present, pango-markup output is unchanged
+    // (the C ignores them) and no meta appears.
+    let vtt = "WEBVTT\n\n\
+               STYLE\n\
+               ::cue(b) { color: red }\n\n\
+               00:00:01.000 --> 00:00:02.000\n\
+               <b>One</b>\n\n";
+    init();
+
+    let mut h = gst_check::Harness::new("rssubparse");
+    h.set_src_caps_str("application/x-subtitle-vtt");
+    h.push(gst::Buffer::from_slice(vtt.as_bytes().to_vec()))
+        .expect("push succeeded");
+    h.push_event(gst::event::Eos::new());
+
+    let buffer = h.try_pull().expect("one cue");
+    assert_eq!(text_of(&buffer), "<b>One</b>");
+    assert!(buffer.meta::<CueIrMeta>().is_none());
+}
+
 /// One framed SSA dialogue row through `rsssaparse` (the container shape:
 /// `codec_data` in caps, one row per timed buffer).
 fn run_ssaparse_framed(row: &str, format: Option<&str>) -> gst::Buffer {

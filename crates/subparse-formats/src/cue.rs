@@ -12,20 +12,32 @@ pub enum OutputFormat {
     PangoMarkup,
 }
 
-/// Optional per-cue presentation settings. Mirrors the positioning fields of the
-/// C `ParserState` (WebVTT cue settings). Non-WebVTT parsers leave this default.
+/// Optional per-cue presentation settings. The first five fields mirror the
+/// positioning fields of the C `ParserState` (the archaic `T:`/`L:`/`S:`/
+/// `D:`/`A:` WebVTT syntax); the rest only exist in the modern
+/// `name:value` syntax, which the C never parsed at all. Non-WebVTT parsers
+/// leave this default. Like the C, the pango-markup output discards all of
+/// it; the `cue-ir` path folds it into the IR's layout.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CueSettings {
-    /// Line position, percent.
+    /// Line position, percent (`L:10%`, `line:10%`).
     pub line_position: Option<u8>,
-    /// Text position, percent.
+    /// Text position, percent (`T:50%`, `position:50%`).
     pub text_position: Option<u8>,
-    /// Text size, percent.
+    /// Text size, percent (`S:35%`, `size:35%`).
     pub text_size: Option<u8>,
-    /// "", "vertical", "vertical-lr".
+    /// `D:` / `vertical:` value: "vertical"/"rl", "vertical-lr"/"lr".
     pub vertical: Option<String>,
-    /// "start", "middle", "end", ...
+    /// `A:` / `align:` value: "start", "middle", "center", "end", ...
     pub alignment: Option<String>,
+    /// Modern `line:<int>` form: a line *number*, 0-based from the start
+    /// edge, negative from the end edge.
+    pub line_number: Option<i32>,
+    /// Modern `line:...,<align>` suffix: "start", "center", "end".
+    pub line_align: Option<String>,
+    /// Modern `position:...,<align>` suffix: "line-left", "center",
+    /// "line-right".
+    pub position_align: Option<String>,
 }
 
 /// A parsed subtitle cue. Timing is nanoseconds from stream start (wraps to
@@ -41,6 +53,10 @@ pub struct Cue {
     pub text: String,
     /// Optional presentation settings (WebVTT).
     pub settings: CueSettings,
+    /// The cue identifier (WebVTT: the line preceding the timing line). Only
+    /// consumed by the `cue-ir` output path (`::cue(#id)` selectors); the
+    /// pango-markup output ignores it, like the C element.
+    pub id: Option<String>,
 }
 
 impl Cue {
@@ -51,6 +67,7 @@ impl Cue {
             end_ns,
             text: text.into(),
             settings: CueSettings::default(),
+            id: None,
         }
     }
 

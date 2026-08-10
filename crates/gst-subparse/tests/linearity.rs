@@ -175,41 +175,40 @@ fn body_with_no_line_breaks_is_still_linear() {
     while body.len() < 20 * 1024 * 1024 {
         body.push_str("this line never ends and never will, not once, no. ");
     }
-    assert!(!body.contains('\n'), "the point of this body is no newlines");
+    assert!(
+        !body.contains('\n'),
+        "the point of this body is no newlines"
+    );
     let len = body.len();
 
-    within(
-        Duration::from_secs(120),
-        "20 MB single line",
-        move || {
-            // One cue at EOS (the unterminated line is flushed at `at_eos`).
-            let baseline = Instant::now();
-            let pulled = stream_through_element(&body, len);
-            let baseline = baseline.elapsed();
-            assert!(pulled <= 1, "expected at most one cue, got {pulled}");
+    within(Duration::from_secs(120), "20 MB single line", move || {
+        // One cue at EOS (the unterminated line is flushed at `at_eos`).
+        let baseline = Instant::now();
+        let pulled = stream_through_element(&body, len);
+        let baseline = baseline.elapsed();
+        assert!(pulled <= 1, "expected at most one cue, got {pulled}");
 
-            let chunked = Instant::now();
-            let pulled = stream_through_element(&body, 4096);
-            let chunked = chunked.elapsed();
-            assert!(pulled <= 1, "expected at most one cue, got {pulled}");
+        let chunked = Instant::now();
+        let pulled = stream_through_element(&body, 4096);
+        let chunked = chunked.elapsed();
+        assert!(pulled <= 1, "expected at most one cue, got {pulled}");
 
-            // 25x the one-buffer cost, floored at a second so a very fast
-            // baseline cannot make this trip on scheduling noise. Quadratic
-            // rescanning lands two orders of magnitude above it.
-            let allowed = (baseline * 25).max(Duration::from_secs(1));
-            eprintln!(
-                "{len} newline-free bytes: one buffer {baseline:?}, \
+        // 25x the one-buffer cost, floored at a second so a very fast
+        // baseline cannot make this trip on scheduling noise. Quadratic
+        // rescanning lands two orders of magnitude above it.
+        let allowed = (baseline * 25).max(Duration::from_secs(1));
+        eprintln!(
+            "{len} newline-free bytes: one buffer {baseline:?}, \
                  4 KB buffers {chunked:?}, allowed {allowed:?}"
-            );
-            assert!(
-                chunked <= allowed,
-                "streaming a newline-free body cost {chunked:?} against a \
+        );
+        assert!(
+            chunked <= allowed,
+            "streaming a newline-free body cost {chunked:?} against a \
                  {baseline:?} single-buffer baseline (allowed {allowed:?}); \
                  the unparsed remainder is being rescanned from the start on \
                  every chain call"
-            );
-        },
-    );
+        );
+    });
 }
 
 /// The same body in one buffer. This is linear even under the old code (one

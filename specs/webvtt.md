@@ -98,6 +98,65 @@ the output buffer or caps. We instead surface them on `Cue.settings`. Absent
 settings are represented as `None` (the C uses `0`/`""` internally). This is a
 richer API, not a parity break, because the C output is identical either way.
 
+**Modern settings syntax.** The one-letter forms above are the archaic
+pre-standard syntax; the W3C spec (and every current file) uses lowercase
+`name:value` tokens, which fall through the C's `switch` unrecognised. We
+parse those too — same surfacing rules, still discarded by pango-markup
+output:
+
+| token                  | fields filled (`CueSettings`)                       |
+|------------------------|-----------------------------------------------------|
+| `line:<n>%[,<align>]`  | `line_position`, `line_align`                       |
+| `line:<int>[,<align>]` | `line_number` (signed, negative = from end), `line_align` |
+| `position:<n>%[,<align>]` | `text_position`, `position_align`                |
+| `size:<n>%`            | `text_size`                                         |
+| `align:<x>`            | `alignment` (`start`/`center`/`end`/`left`/`right`) |
+| `vertical:<x>`         | `vertical` (`rl`/`lr`)                              |
+| `region:<id>`          | *(none — regions are not modeled)*                  |
+
+Percentages are validated to `[0, 100]` and rounded (no C-style wrapping —
+the C never parsed these at all). The lowercase names can never collide with
+the uppercase one-letter forms, so both syntaxes coexist.
+
+### `STYLE` blocks and cue identifiers (cue-ir only)
+
+The C ignores `STYLE` blocks (they are non-timing lines) and so does our
+pango-markup output. For `text-format=cue-ir` the parser additionally
+*collects* them: a line that is exactly `STYLE` (case-sensitive, no leading or
+trailing anything), seen **before the first cue**, starts a CSS block that
+runs to the next blank line (a `-->` line also terminates it and is
+reprocessed as the cue timing line, per the spec's block collector; `STYLE`
+after the first cue is ignored, as WPT `embedded_style_invalid_format.vtt`
+pins). Collection is parity-neutral by construction: while seeking, the C
+ignores every non-timing line anyway, and timing lines are handed back.
+
+The collected CSS is parsed by `subparse_formats::vttcss` (see its module
+docs for the supported selector/property subset) and exposed via
+`SubtitleFormat::stylesheet()`; the elements pass it to `ir::cue_to_ir`,
+which applies matching rules while building the `CueIr`:
+
+- `::cue` (and `::cue(#id)` when the id matches) → `CueIr::base`;
+- `::cue(<compound>)` → matched against each inline tag as it opens, author
+  CSS overriding the tag-derived styling, deeper tags overriding inherited
+  values (CSS cascade/inheritance semantics);
+- selector subjects are matched against the spec's *featureless* originating
+  element: `::cue`, `*::cue`, `*|*::cue`, `|*::cue`, `:not(video)::cue`
+  apply; `video::cue`, `ns|*::cue` and anything with a combinator do not
+  (WPT `embedded_style_selectors.vtt`).
+
+Known, deliberate divergences from a browser: `@media` queries are skipped
+whole (an element has no viewport at parse time), `opacity`/`visibility`/
+`background-image` and other unmapped properties parse and are dropped,
+`:past`/`:future` never match (they depend on the render clock), and
+`!important` is stripped rather than cascaded.
+
+The cue identifier (the non-blank line immediately preceding an accepted
+timing line, reset by blank lines) is surfaced as `Cue.id` for `::cue(#id)`
+matching. The C reads and discards these lines; parity again holds.
+
+The `tests/golden/wptvtt` snapshots in `gst-subparse` pin all of this over
+the WPT corpus (regenerate with `UPDATE_GOLDEN=1`, then review the diff).
+
 ### Text → Pango markup pipeline (state-2 tail of `parse_subrip`)
 
 Applied in order to the accumulated cue text:

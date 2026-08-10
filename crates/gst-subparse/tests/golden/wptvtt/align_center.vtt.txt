@@ -1,0 +1,6 @@
+cue 0: 0.000 +5.000
+  pango: "This is a test"
+  text: "This is a test"
+  layout: align=center
+  line:
+    span "This is a test"

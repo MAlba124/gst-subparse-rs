@@ -87,6 +87,17 @@ pub trait SubtitleFormat {
 
     /// The text flavour this parser emits.
     fn output_format(&self) -> OutputFormat;
+
+    /// The stylesheet this stream has declared so far, if the format has such
+    /// a concept (WebVTT `STYLE` blocks). `STYLE` blocks precede the cues
+    /// they style, so by the time a cue comes out of
+    /// [`parse_incremental`](SubtitleFormat::parse_incremental) the sheet it
+    /// should be rendered with is already here. The `cue-ir` output path
+    /// feeds it to [`crate::ir::cue_to_ir`]; pango-markup output never reads
+    /// it (the C element ignores styling, and parity holds).
+    fn stylesheet(&self) -> Option<&crate::vttcss::Stylesheet> {
+        None
+    }
 }
 
 /// Splits an incrementally-growing body into complete (`\n`-terminated) lines.

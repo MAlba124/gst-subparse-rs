@@ -1,0 +1,8 @@
+cue 0: 0.000 +10.000
+  pango: "Hello!\nשלום!"
+  text: "Hello!\nשלום!"
+  layout: line=0 align=start
+  line:
+    span "Hello!"
+  line:
+    span "שלום!"

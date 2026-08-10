@@ -27,6 +27,14 @@ if let Some(meta) = buffer.meta::<gstrssubparse::cueir::CueIrMeta>() {
 }
 ```
 
+For WebVTT, cue-ir mode goes beyond what the C plugin ever surfaced: `STYLE`
+blocks are parsed (`::cue` selectors with classes, voices, ids, `:lang`;
+colors, fonts, text-shadow, outline, ruby-position — see
+`subparse_formats::vttcss`) and applied to the IR with CSS cascade semantics,
+and both the archaic (`T:`/`A:`/...) and modern (`align:center
+position:50%`) cue-settings syntaxes fold into the IR's layout. The default
+pango-markup output stays byte-identical to the C either way.
+
 [crates/cueir-demo](crates/cueir-demo/) is a runnable end-to-end demo of
 exactly that (a standalone crate, not a workspace member): it pipes a subtitle
 file through `rssubparse text-format=cue-ir` and renders each cue to a PNG
