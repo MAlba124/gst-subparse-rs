@@ -1,0 +1,1406 @@
+// SPDX-FileCopyrightText: 2026 Marcus Hanestad <marlhan@proton.me>
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+//! A renderer-oriented intermediate representation (IR) for subtitle cues.
+//!
+//! [`CueIr`] describes one cue as plain-old-data: a list of visual
+//! [`Line`]s, each a list of styled [`Span`]s, plus cue-level [`Layout`]
+//! (positioning, alignment, writing direction). It exists so a custom renderer
+//! (e.g. one built on `parley` for text layout and `vello_cpu` for rasterizing)
+//! can draw styled cues without parsing Pango markup, while the default
+//! pango-markup output stays exactly what the C `subparse` emits.
+//!
+//! The types deliberately cover more than what today's parsers produce (SSA
+//! outline/shadow/scale, WebVTT regions-ish positioning, ruby, karaoke reveal
+//! times), so parsers can grow into them without another IR revision:
+//!
+//! * [`SpanStyle`] maps 1:1 onto `parley` style properties (font stack, size,
+//!   weight, style, underline/strikethrough, brush) plus the paint-level
+//!   extras `parley` leaves to the renderer (background box, outline, shadow,
+//!   baseline shift).
+//! * [`Layout`] carries WebVTT cue settings (`line`/`position`/`size`/`align`/
+//!   `vertical`) and the SSA/ASS placement model (numpad anchor, margins,
+//!   explicit origin). All positional values are percentages of the video
+//!   frame in `[0, 100]`, so the renderer needs no knowledge of the source
+//!   format's coordinate space.
+//!
+//! Two constructors cover everything the parsers emit today:
+//! [`CueIr::from_pango_markup`] understands the (closed) markup subset the
+//! `subparse-formats` parsers generate — `<i>/<b>/<u>` (SubRip, MPL2),
+//! `<span>` with `foreground`/`font_family`/`size`/`rise` (SAMI),
+//! `style`/`weight`/`size` (MicroDVD), `font`/`color`/`bgcolor` (QTtext) — as
+//! well as the WebVTT tags the C keeps verbatim (`<c>`, `<v>`, `<ruby>`,
+//! `<rt>`). [`CueIr::from_plain_text`] wraps unstyled text. [`cue_to_ir`]
+//! picks between them and folds the cue's [`CueSettings`] into the layout.
+//!
+//! Like the rest of this crate, the module is dependency-free (std only).
+
+use crate::cue::{Cue, CueSettings, OutputFormat};
+
+// -- colors ------------------------------------------------------------------
+
+/// An sRGB color with straight (non-premultiplied) alpha.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl Color {
+    pub const WHITE: Color = Color::rgb(0xff, 0xff, 0xff);
+    pub const BLACK: Color = Color::rgb(0x00, 0x00, 0x00);
+    pub const TRANSPARENT: Color = Color {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 0,
+    };
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b, a: 0xff }
+    }
+
+    pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+        Color { r, g, b, a }
+    }
+
+    /// Parse a color the way `pango_color_parse` does: `#rgb`, `#rrggbb`,
+    /// `#rrrgggbbb`, `#rrrrggggbbbb` or a named CSS/X11 color. Returns `None`
+    /// for anything unrecognised.
+    pub fn parse(s: &str) -> Option<Color> {
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix('#') {
+            return Color::parse_hex(hex);
+        }
+        named_color(s)
+    }
+
+    fn parse_hex(hex: &str) -> Option<Color> {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        // Per-channel digit count, as in pango: 1..=4 digits per channel.
+        let per = match hex.len() {
+            3 => 1,
+            6 => 2,
+            9 => 3,
+            12 => 4,
+            _ => return None,
+        };
+        let chan = |i: usize| -> u8 {
+            let v = u32::from_str_radix(&hex[i * per..(i + 1) * per], 16).unwrap();
+            // Scale an n-digit channel to 8 bits (top byte of the value
+            // left-aligned to 16 bits, which is what pango does).
+            let max = (1u32 << (4 * per)) - 1;
+            ((v * 255 + max / 2) / max) as u8
+        };
+        Some(Color::rgb(chan(0), chan(1), chan(2)))
+    }
+}
+
+/// The CSS3 / X11 named colors (the set `pango_color_parse` accepts, matched
+/// ASCII case-insensitively), sorted by name for binary search.
+const NAMED_COLORS: &[(&str, u32)] = &[
+    ("aliceblue", 0xf0f8ff),
+    ("antiquewhite", 0xfaebd7),
+    ("aqua", 0x00ffff),
+    ("aquamarine", 0x7fffd4),
+    ("azure", 0xf0ffff),
+    ("beige", 0xf5f5dc),
+    ("bisque", 0xffe4c4),
+    ("black", 0x000000),
+    ("blanchedalmond", 0xffebcd),
+    ("blue", 0x0000ff),
+    ("blueviolet", 0x8a2be2),
+    ("brown", 0xa52a2a),
+    ("burlywood", 0xdeb887),
+    ("cadetblue", 0x5f9ea0),
+    ("chartreuse", 0x7fff00),
+    ("chocolate", 0xd2691e),
+    ("coral", 0xff7f50),
+    ("cornflowerblue", 0x6495ed),
+    ("cornsilk", 0xfff8dc),
+    ("crimson", 0xdc143c),
+    ("cyan", 0x00ffff),
+    ("darkblue", 0x00008b),
+    ("darkcyan", 0x008b8b),
+    ("darkgoldenrod", 0xb8860b),
+    ("darkgray", 0xa9a9a9),
+    ("darkgreen", 0x006400),
+    ("darkgrey", 0xa9a9a9),
+    ("darkkhaki", 0xbdb76b),
+    ("darkmagenta", 0x8b008b),
+    ("darkolivegreen", 0x556b2f),
+    ("darkorange", 0xff8c00),
+    ("darkorchid", 0x9932cc),
+    ("darkred", 0x8b0000),
+    ("darksalmon", 0xe9967a),
+    ("darkseagreen", 0x8fbc8f),
+    ("darkslateblue", 0x483d8b),
+    ("darkslategray", 0x2f4f4f),
+    ("darkslategrey", 0x2f4f4f),
+    ("darkturquoise", 0x00ced1),
+    ("darkviolet", 0x9400d3),
+    ("deeppink", 0xff1493),
+    ("deepskyblue", 0x00bfff),
+    ("dimgray", 0x696969),
+    ("dimgrey", 0x696969),
+    ("dodgerblue", 0x1e90ff),
+    ("firebrick", 0xb22222),
+    ("floralwhite", 0xfffaf0),
+    ("forestgreen", 0x228b22),
+    ("fuchsia", 0xff00ff),
+    ("gainsboro", 0xdcdcdc),
+    ("ghostwhite", 0xf8f8ff),
+    ("gold", 0xffd700),
+    ("goldenrod", 0xdaa520),
+    ("gray", 0x808080),
+    ("green", 0x008000),
+    ("greenyellow", 0xadff2f),
+    ("grey", 0x808080),
+    ("honeydew", 0xf0fff0),
+    ("hotpink", 0xff69b4),
+    ("indianred", 0xcd5c5c),
+    ("indigo", 0x4b0082),
+    ("ivory", 0xfffff0),
+    ("khaki", 0xf0e68c),
+    ("lavender", 0xe6e6fa),
+    ("lavenderblush", 0xfff0f5),
+    ("lawngreen", 0x7cfc00),
+    ("lemonchiffon", 0xfffacd),
+    ("lightblue", 0xadd8e6),
+    ("lightcoral", 0xf08080),
+    ("lightcyan", 0xe0ffff),
+    ("lightgoldenrodyellow", 0xfafad2),
+    ("lightgray", 0xd3d3d3),
+    ("lightgreen", 0x90ee90),
+    ("lightgrey", 0xd3d3d3),
+    ("lightpink", 0xffb6c1),
+    ("lightsalmon", 0xffa07a),
+    ("lightseagreen", 0x20b2aa),
+    ("lightskyblue", 0x87cefa),
+    ("lightslategray", 0x778899),
+    ("lightslategrey", 0x778899),
+    ("lightsteelblue", 0xb0c4de),
+    ("lightyellow", 0xffffe0),
+    ("lime", 0x00ff00),
+    ("limegreen", 0x32cd32),
+    ("linen", 0xfaf0e6),
+    ("magenta", 0xff00ff),
+    ("maroon", 0x800000),
+    ("mediumaquamarine", 0x66cdaa),
+    ("mediumblue", 0x0000cd),
+    ("mediumorchid", 0xba55d3),
+    ("mediumpurple", 0x9370db),
+    ("mediumseagreen", 0x3cb371),
+    ("mediumslateblue", 0x7b68ee),
+    ("mediumspringgreen", 0x00fa9a),
+    ("mediumturquoise", 0x48d1cc),
+    ("mediumvioletred", 0xc71585),
+    ("midnightblue", 0x191970),
+    ("mintcream", 0xf5fffa),
+    ("mistyrose", 0xffe4e1),
+    ("moccasin", 0xffe4b5),
+    ("navajowhite", 0xffdead),
+    ("navy", 0x000080),
+    ("oldlace", 0xfdf5e6),
+    ("olive", 0x808000),
+    ("olivedrab", 0x6b8e23),
+    ("orange", 0xffa500),
+    ("orangered", 0xff4500),
+    ("orchid", 0xda70d6),
+    ("palegoldenrod", 0xeee8aa),
+    ("palegreen", 0x98fb98),
+    ("paleturquoise", 0xafeeee),
+    ("palevioletred", 0xdb7093),
+    ("papayawhip", 0xffefd5),
+    ("peachpuff", 0xffdab9),
+    ("peru", 0xcd853f),
+    ("pink", 0xffc0cb),
+    ("plum", 0xdda0dd),
+    ("powderblue", 0xb0e0e6),
+    ("purple", 0x800080),
+    ("red", 0xff0000),
+    ("rosybrown", 0xbc8f8f),
+    ("royalblue", 0x4169e1),
+    ("saddlebrown", 0x8b4513),
+    ("salmon", 0xfa8072),
+    ("sandybrown", 0xf4a460),
+    ("seagreen", 0x2e8b57),
+    ("seashell", 0xfff5ee),
+    ("sienna", 0xa0522d),
+    ("silver", 0xc0c0c0),
+    ("skyblue", 0x87ceeb),
+    ("slateblue", 0x6a5acd),
+    ("slategray", 0x708090),
+    ("slategrey", 0x708090),
+    ("snow", 0xfffafa),
+    ("springgreen", 0x00ff7f),
+    ("steelblue", 0x4682b4),
+    ("tan", 0xd2b48c),
+    ("teal", 0x008080),
+    ("thistle", 0xd8bfd8),
+    ("tomato", 0xff6347),
+    ("turquoise", 0x40e0d0),
+    ("violet", 0xee82ee),
+    ("wheat", 0xf5deb3),
+    ("white", 0xffffff),
+    ("whitesmoke", 0xf5f5f5),
+    ("yellow", 0xffff00),
+    ("yellowgreen", 0x9acd32),
+];
+
+fn named_color(name: &str) -> Option<Color> {
+    let lower = name.to_ascii_lowercase();
+    NAMED_COLORS
+        .binary_search_by(|(n, _)| n.cmp(&lower.as_str()))
+        .ok()
+        .map(|i| {
+            let v = NAMED_COLORS[i].1;
+            Color::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+        })
+}
+
+// -- span-level styling --------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+    Oblique,
+}
+
+/// A font size, either absolute or relative to the renderer's base size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontSize {
+    /// Absolute size in points.
+    Points(f32),
+    /// A factor applied to the renderer's base cue size (`1.0` = base).
+    Scale(f32),
+}
+
+/// A text outline (SSA/ASS border, CC edge). Drawn as a stroke behind the
+/// glyph fill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outline {
+    pub color: Color,
+    /// Stroke width in points.
+    pub width: f32,
+}
+
+/// A drop shadow behind the text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shadow {
+    pub color: Color,
+    /// Offset in points, positive right/down.
+    pub dx: f32,
+    pub dy: f32,
+    /// Gaussian blur radius in points (`0.0` = hard shadow).
+    pub blur: f32,
+}
+
+/// Character styling for one span. Every field is optional; `None` means
+/// "inherit", first from [`CueIr::base`], then from the renderer's defaults.
+///
+/// The fields map onto `parley` style properties (font stack/size/weight/
+/// style, underline, strikethrough, letter spacing, brush color, locale). The
+/// rest — background box, outline, shadow, baseline shift, glyph scale — are
+/// paint-level and handled by the renderer around parley's layout.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SpanStyle {
+    /// Font family name (a parley font stack entry). `None` = default font.
+    pub font_family: Option<String>,
+    pub font_size: Option<FontSize>,
+    pub font_style: Option<FontStyle>,
+    /// CSS-style weight: 400 normal, 700 bold.
+    pub font_weight: Option<u16>,
+    pub underline: Option<bool>,
+    pub strikethrough: Option<bool>,
+    /// Text (fill) color.
+    pub foreground: Option<Color>,
+    /// Background box painted behind this span's glyphs.
+    pub background: Option<Color>,
+    pub outline: Option<Outline>,
+    pub shadow: Option<Shadow>,
+    /// Additional letter spacing in points (SSA `\fsp`, pango
+    /// `letter_spacing`).
+    pub letter_spacing: Option<f32>,
+    /// Vertical baseline displacement in points, positive = raised (pango
+    /// `rise`, sub/superscript).
+    pub baseline_shift: Option<f32>,
+    /// Horizontal/vertical glyph scale factors (SSA `\fscx`/`\fscy`, `1.0` =
+    /// unscaled).
+    pub scale: Option<(f32, f32)>,
+    /// BCP-47 language tag for shaping/line breaking (WebVTT `<lang>`, pango
+    /// `lang`).
+    pub language: Option<String>,
+}
+
+impl SpanStyle {
+    /// Whether every field is `None` (the span adds nothing over the base).
+    pub fn is_plain(&self) -> bool {
+        *self == SpanStyle::default()
+    }
+}
+
+/// Where a ruby annotation is drawn relative to its base text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RubyPosition {
+    /// Above horizontal text / right of vertical text.
+    #[default]
+    Over,
+    /// Below horizontal text / left of vertical text.
+    Under,
+}
+
+/// A ruby annotation attached to a base [`Span`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ruby {
+    pub text: String,
+    pub position: RubyPosition,
+}
+
+/// A run of text with uniform styling.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Span {
+    pub text: String,
+    pub style: SpanStyle,
+    /// WebVTT voice (`<v Fred>`): the speaker this span is attributed to.
+    pub voice: Option<String>,
+    /// WebVTT classes (`<c.yellow.bg_blue>`), verbatim. The standard color
+    /// classes are *also* resolved into `style.foreground`/`.background`.
+    pub classes: Vec<String>,
+    /// Ruby annotation over this span's text (WebVTT `<ruby>`/`<rt>`).
+    pub ruby: Option<Ruby>,
+    /// For karaoke/rolling captions: presentation time (nanoseconds, same
+    /// timeline as the cue) at which this span becomes visible. `None` =
+    /// visible for the cue's whole duration.
+    pub reveal_ns: Option<u64>,
+}
+
+impl Span {
+    pub fn plain(text: impl Into<String>) -> Span {
+        Span {
+            text: text.into(),
+            ..Span::default()
+        }
+    }
+}
+
+/// One visual line (spans are laid out left to right / top to bottom in the
+/// cue's writing direction; there are no newlines inside spans).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Line {
+    pub spans: Vec<Span>,
+}
+
+// -- cue-level layout ------------------------------------------------------
+
+/// Block progression direction (WebVTT `vertical` setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WritingMode {
+    /// Horizontal lines, stacked top to bottom.
+    #[default]
+    HorizontalTb,
+    /// Vertical lines, stacked right to left.
+    VerticalRl,
+    /// Vertical lines, stacked left to right.
+    VerticalLr,
+}
+
+/// Text alignment within the cue box (WebVTT `align`, SSA style alignment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlign {
+    /// Toward the start of the text direction (left for LTR text).
+    Start,
+    Center,
+    /// Toward the end of the text direction.
+    End,
+    Left,
+    Right,
+}
+
+/// Which edge of the cue box the `line` position pins (WebVTT `line` align).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineAlign {
+    Start,
+    Center,
+    End,
+}
+
+/// Alignment of the cue box around its `position` (WebVTT position align).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionAlign {
+    Auto,
+    LineLeft,
+    Center,
+    LineRight,
+}
+
+/// The WebVTT `line` setting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LinePosition {
+    /// Percentage of the video frame in the block direction, `[0, 100]`.
+    Percent(f32),
+    /// A line *number*: 0-based from the start edge, negative counts from the
+    /// end edge (`-1` is the last line).
+    Line(i32),
+}
+
+/// A 9-way anchor (SSA/ASS numpad alignment, CEA-708 anchor points): which
+/// point of the cue box the cue's position refers to, and the default
+/// placement when no explicit position is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+/// Distances from the video frame edges the cue must keep clear, as
+/// percentages of the frame in `[0, 100]` (SSA margins, normalised out of
+/// `PlayRes` space by the parser).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Margins {
+    pub left: f32,
+    pub right: f32,
+    pub vertical: f32,
+}
+
+/// Cue-level placement. Everything is optional: an all-default layout means
+/// "bottom-center, per the renderer's house style", which is what plain SRT
+/// wants.
+///
+/// All positional values are percentages of the video frame in `[0, 100]`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Layout {
+    pub writing_mode: WritingMode,
+    /// WebVTT `line`: where the cue box sits in the block direction.
+    pub line: Option<LinePosition>,
+    pub line_align: Option<LineAlign>,
+    /// WebVTT `position`: where the cue box sits in the inline direction
+    /// (percent).
+    pub position: Option<f32>,
+    pub position_align: Option<PositionAlign>,
+    /// WebVTT `size`: extent of the cue box in the inline direction (percent).
+    pub size: Option<f32>,
+    /// Text alignment within the cue box.
+    pub align: Option<TextAlign>,
+    /// SSA-style anchor of the cue box (numpad alignment).
+    pub anchor: Option<Anchor>,
+    /// Explicit anchor-point position (SSA `\pos`), percent of the frame.
+    pub origin: Option<(f32, f32)>,
+    pub margins: Option<Margins>,
+    /// Fill behind the whole cue box (SSA `BorderStyle=3`, CC window color).
+    pub background: Option<Color>,
+}
+
+// -- the cue ---------------------------------------------------------------
+
+/// A fully styled subtitle cue, ready for a custom renderer. Timing stays on
+/// the `GstBuffer` (PTS/duration), exactly as for pango-markup output.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CueIr {
+    pub layout: Layout,
+    /// Style every span inherits where its own [`SpanStyle`] is `None` (SSA
+    /// style defaults live here). Renderer defaults fill whatever is still
+    /// unset after that.
+    pub base: SpanStyle,
+    pub lines: Vec<Line>,
+}
+
+impl CueIr {
+    /// The unstyled text: span texts concatenated, lines joined with `\n`.
+    /// Ruby annotations are not included. This is what the buffer payload
+    /// carries in `cue-ir` output mode.
+    pub fn plain_text(&self) -> String {
+        let mut out = String::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            if i != 0 {
+                out.push('\n');
+            }
+            for span in &line.spans {
+                out.push_str(&span.text);
+            }
+        }
+        out
+    }
+
+    /// Wrap plain UTF-8 text (no markup) into an unstyled cue.
+    pub fn from_plain_text(text: &str) -> CueIr {
+        CueIr {
+            lines: text
+                .split('\n')
+                .map(|l| {
+                    let l = l.strip_suffix('\r').unwrap_or(l);
+                    Line {
+                        spans: if l.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![Span::plain(l)]
+                        },
+                    }
+                })
+                .collect(),
+            ..CueIr::default()
+        }
+    }
+
+    /// Parse the pango-markup subset the `subparse-formats` parsers emit into
+    /// styled spans. Lenient: unknown tags are dropped (their content kept),
+    /// unclosed tags close at the end of the cue, stray closers are ignored.
+    pub fn from_pango_markup(markup: &str) -> CueIr {
+        markup::parse(markup)
+    }
+}
+
+/// Build the IR for one parsed [`Cue`], honouring the flavour `output` says
+/// its text is in and folding its WebVTT [`CueSettings`] into the layout.
+pub fn cue_to_ir(cue: &Cue, output: OutputFormat) -> CueIr {
+    let text = cue.text.trim_end_matches(['\n', '\r']);
+    let mut ir = match output {
+        OutputFormat::Utf8 => CueIr::from_plain_text(text),
+        OutputFormat::PangoMarkup => CueIr::from_pango_markup(text),
+    };
+    apply_settings(&mut ir.layout, &cue.settings);
+    ir
+}
+
+/// Fold parsed WebVTT cue settings into a [`Layout`].
+fn apply_settings(layout: &mut Layout, s: &CueSettings) {
+    if let Some(v) = s.line_position {
+        layout.line = Some(LinePosition::Percent(v as f32));
+    }
+    if let Some(v) = s.text_position {
+        layout.position = Some(v as f32);
+    }
+    if let Some(v) = s.text_size {
+        layout.size = Some(v as f32);
+    }
+    if let Some(v) = s.vertical.as_deref() {
+        layout.writing_mode = match v {
+            "vertical" => WritingMode::VerticalRl,
+            "vertical-lr" => WritingMode::VerticalLr,
+            _ => WritingMode::HorizontalTb,
+        };
+    }
+    if let Some(a) = s.alignment.as_deref() {
+        layout.align = match a {
+            "start" => Some(TextAlign::Start),
+            "middle" | "center" => Some(TextAlign::Center),
+            "end" => Some(TextAlign::End),
+            "left" => Some(TextAlign::Left),
+            "right" => Some(TextAlign::Right),
+            _ => layout.align,
+        };
+    }
+}
+
+// -- pango-markup subset parser ---------------------------------------------
+
+mod markup {
+    use super::*;
+
+    /// The parse state that tags push/pop.
+    #[derive(Debug, Clone, Default)]
+    struct Ctx {
+        style: SpanStyle,
+        voice: Option<String>,
+        classes: Vec<String>,
+        /// Inside `<ruby>`.
+        in_ruby: bool,
+        /// Inside `<rt>` (text goes to the annotation, not the line).
+        in_rt: bool,
+    }
+
+    struct Parser {
+        lines: Vec<Line>,
+        cur_line: Vec<Span>,
+        cur_text: String,
+        ctx: Ctx,
+        /// (tag name, state to restore on close).
+        stack: Vec<(String, Ctx)>,
+        /// Annotation text accumulating inside `<rt>`.
+        rt_text: String,
+    }
+
+    pub(super) fn parse(input: &str) -> CueIr {
+        let mut p = Parser {
+            lines: Vec::new(),
+            cur_line: Vec::new(),
+            cur_text: String::new(),
+            ctx: Ctx::default(),
+            stack: Vec::new(),
+            rt_text: String::new(),
+        };
+
+        let bytes = input.as_bytes();
+        let mut pos = 0;
+        while pos < input.len() {
+            match bytes[pos] {
+                b'<' => match input[pos + 1..].find('>') {
+                    Some(rel) => {
+                        let tag = &input[pos + 1..pos + 1 + rel];
+                        p.handle_tag(tag);
+                        pos += rel + 2;
+                    }
+                    None => {
+                        // No closing '>': treat the rest as text, like the
+                        // GMarkup-based C strip does for recovery.
+                        p.text(&input[pos..]);
+                        break;
+                    }
+                },
+                b'&' => {
+                    let (ch, used) = decode_entity(&input[pos..]);
+                    match ch {
+                        Some(c) => p.push_char(c),
+                        None => p.push_char('&'),
+                    }
+                    pos += used;
+                }
+                b'\n' => {
+                    p.end_line();
+                    pos += 1;
+                }
+                _ => {
+                    let end = input[pos..]
+                        .find(['<', '&', '\n'])
+                        .map(|rel| pos + rel)
+                        .unwrap_or(input.len());
+                    p.text(&input[pos..end]);
+                    pos = end;
+                }
+            }
+        }
+        p.finish()
+    }
+
+    /// Decode one `&...;` reference starting at `input` (which begins with
+    /// `&`). Returns the character and how many bytes were consumed; an
+    /// unrecognised or unterminated reference consumes only the `&`.
+    fn decode_entity(input: &str) -> (Option<char>, usize) {
+        let semi = match input[1..].find(';') {
+            // Entity names are short; don't scan the whole cue for a stray ';'.
+            Some(rel) if rel <= 12 => 1 + rel,
+            _ => return (None, 1),
+        };
+        let name = &input[1..semi];
+        let ch = match name {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => {
+                if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                    u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
+                } else if let Some(dec) = name.strip_prefix('#') {
+                    dec.parse::<u32>().ok().and_then(char::from_u32)
+                } else {
+                    None
+                }
+            }
+        };
+        match ch {
+            Some(c) => (Some(c), semi + 1),
+            None => (None, 1),
+        }
+    }
+
+    impl Parser {
+        fn text(&mut self, s: &str) {
+            if self.ctx.in_rt {
+                self.rt_text.push_str(s);
+            } else {
+                self.cur_text.push_str(s);
+            }
+        }
+
+        fn push_char(&mut self, c: char) {
+            if self.ctx.in_rt {
+                self.rt_text.push(c);
+            } else {
+                self.cur_text.push(c);
+            }
+        }
+
+        /// Emit the accumulated text as a span with the current state.
+        fn flush(&mut self) {
+            if self.cur_text.is_empty() {
+                return;
+            }
+            let text = std::mem::take(&mut self.cur_text);
+            // Merge with the previous span when nothing about the styling
+            // differs; markup like `a<x>b</x>c` should not fragment "abc".
+            if let Some(last) = self.cur_line.last_mut()
+                && last.style == self.ctx.style
+                && last.voice == self.ctx.voice
+                && last.classes == self.ctx.classes
+                && last.ruby.is_none()
+            {
+                last.text.push_str(&text);
+                return;
+            }
+            self.cur_line.push(Span {
+                text,
+                style: self.ctx.style.clone(),
+                voice: self.ctx.voice.clone(),
+                classes: self.ctx.classes.clone(),
+                ruby: None,
+                reveal_ns: None,
+            });
+        }
+
+        fn end_line(&mut self) {
+            self.flush();
+            let spans = std::mem::take(&mut self.cur_line);
+            self.lines.push(Line { spans });
+        }
+
+        fn finish(mut self) -> CueIr {
+            // Close whatever is still open (attaches a pending annotation).
+            while let Some((name, saved)) = self.stack.pop() {
+                self.close_frame(&name, saved);
+            }
+            self.flush();
+            if !self.cur_line.is_empty() || self.lines.is_empty() {
+                let spans = std::mem::take(&mut self.cur_line);
+                self.lines.push(Line { spans });
+            }
+            CueIr {
+                lines: self.lines,
+                ..CueIr::default()
+            }
+        }
+
+        /// `tag` is the text between `<` and `>`.
+        fn handle_tag(&mut self, tag: &str) {
+            let tag = tag.trim();
+            if let Some(rest) = tag.strip_prefix('/') {
+                let name = tag_name(rest.trim_start());
+                self.close_tag(&name);
+            } else {
+                self.open_tag(tag);
+            }
+        }
+
+        fn open_tag(&mut self, tag: &str) {
+            let name = tag_name(tag);
+            if name.is_empty() {
+                return;
+            }
+            let rest = &tag[name.len()..];
+            // The state change happens between spans by definition.
+            self.flush();
+            let saved = self.ctx.clone();
+            match name.as_str() {
+                "i" => self.ctx.style.font_style = Some(FontStyle::Italic),
+                "b" => self.ctx.style.font_weight = Some(700),
+                "u" => self.ctx.style.underline = Some(true),
+                "s" => self.ctx.style.strikethrough = Some(true),
+                "big" => self.ctx.style.font_size = Some(FontSize::Scale(1.2)),
+                "small" => self.ctx.style.font_size = Some(FontSize::Scale(1.0 / 1.2)),
+                "tt" => self.ctx.style.font_family = Some("monospace".to_owned()),
+                "sub" => self.ctx.style.baseline_shift = Some(-3.0),
+                "sup" => self.ctx.style.baseline_shift = Some(3.0),
+                "span" => self.apply_span_attrs(rest),
+                "v" => {
+                    // WebVTT voice: the annotation is everything after the
+                    // name, e.g. `<v Fred>`.
+                    let annotation = rest.trim();
+                    if !annotation.is_empty() {
+                        self.ctx.voice = Some(annotation.to_owned());
+                    }
+                }
+                "c" => self.apply_vtt_classes(rest),
+                "lang" => {
+                    let l = rest.trim();
+                    if !l.is_empty() {
+                        self.ctx.style.language = Some(l.to_owned());
+                    }
+                }
+                "ruby" => self.ctx.in_ruby = true,
+                // <rt> outside <ruby> has no base text to annotate.
+                "rt" if self.ctx.in_ruby => self.ctx.in_rt = true,
+                "rt" => {}
+                // Unknown tag: keep the content, drop the styling.
+                _ => {}
+            }
+            self.stack.push((name, saved));
+        }
+
+        fn close_tag(&mut self, name: &str) {
+            // Lenient matching: close up to the innermost open tag with this
+            // name; a closer that was never opened does nothing.
+            let Some(at) = self.stack.iter().rposition(|(n, _)| n == name) else {
+                return;
+            };
+            self.flush();
+            while self.stack.len() > at {
+                let (n, saved) = self.stack.pop().unwrap();
+                self.close_frame(&n, saved);
+            }
+        }
+
+        /// Restore `saved` for one popped frame, attaching a finished ruby
+        /// annotation when the frame is the `<rt>` that collected it.
+        fn close_frame(&mut self, name: &str, saved: Ctx) {
+            self.flush();
+            if name == "rt" && self.ctx.in_rt {
+                let text = std::mem::take(&mut self.rt_text);
+                if !text.is_empty() {
+                    let ruby = Ruby {
+                        text,
+                        position: RubyPosition::Over,
+                    };
+                    // Annotate the base text: the span just before the <rt>.
+                    if let Some(base) = self.cur_line.last_mut() {
+                        base.ruby = Some(ruby);
+                    } else {
+                        // <rt> with no base text: emit an empty base span so
+                        // the annotation is not lost.
+                        self.cur_line.push(Span {
+                            ruby: Some(ruby),
+                            ..Span::default()
+                        });
+                    }
+                }
+            }
+            self.ctx = saved;
+        }
+
+        /// `<span key="value" ...>` attributes (the pango set our parsers
+        /// emit, plus pango's documented aliases).
+        fn apply_span_attrs(&mut self, attrs: &str) {
+            for (key, value) in AttrIter::new(attrs) {
+                let style = &mut self.ctx.style;
+                match key.to_ascii_lowercase().as_str() {
+                    "style" => {
+                        style.font_style = match value.to_ascii_lowercase().as_str() {
+                            "italic" => Some(FontStyle::Italic),
+                            "oblique" => Some(FontStyle::Oblique),
+                            "normal" => Some(FontStyle::Normal),
+                            _ => style.font_style,
+                        }
+                    }
+                    "weight" => {
+                        style.font_weight = match value.to_ascii_lowercase().as_str() {
+                            "thin" => Some(100),
+                            "ultralight" => Some(200),
+                            "light" => Some(300),
+                            "semilight" => Some(350),
+                            "book" => Some(380),
+                            "normal" => Some(400),
+                            "medium" => Some(500),
+                            "semibold" => Some(600),
+                            "bold" => Some(700),
+                            "ultrabold" => Some(800),
+                            "heavy" => Some(900),
+                            "ultraheavy" => Some(1000),
+                            v => v.parse::<u16>().ok().or(style.font_weight),
+                        }
+                    }
+                    "size" => {
+                        if let Some(size) = parse_size(&value) {
+                            style.font_size = Some(size);
+                        }
+                    }
+                    "foreground" | "fgcolor" | "color" => {
+                        if let Some(c) = Color::parse(&value) {
+                            style.foreground = Some(c);
+                        }
+                    }
+                    "background" | "bgcolor" => {
+                        if let Some(c) = Color::parse(&value) {
+                            style.background = Some(c);
+                        }
+                    }
+                    "font_family" | "face" => {
+                        style.font_family = Some(value);
+                    }
+                    "font" | "font_desc" => {
+                        let (family, size) = parse_font_desc(&value);
+                        if let Some(f) = family {
+                            style.font_family = Some(f);
+                        }
+                        if let Some(s) = size {
+                            style.font_size = Some(FontSize::Points(s));
+                        }
+                    }
+                    "underline" => {
+                        style.underline = match value.to_ascii_lowercase().as_str() {
+                            "none" => Some(false),
+                            "single" | "double" | "low" | "error" => Some(true),
+                            _ => style.underline,
+                        }
+                    }
+                    "strikethrough" => {
+                        style.strikethrough = match value.to_ascii_lowercase().as_str() {
+                            "true" => Some(true),
+                            "false" => Some(false),
+                            _ => style.strikethrough,
+                        }
+                    }
+                    // 1024ths of a point, like pango.
+                    "rise" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            style.baseline_shift = Some(v / 1024.0);
+                        }
+                    }
+                    "letter_spacing" => {
+                        if let Ok(v) = value.parse::<f32>() {
+                            style.letter_spacing = Some(v / 1024.0);
+                        }
+                    }
+                    "lang" => style.language = Some(value),
+                    _ => {}
+                }
+            }
+        }
+
+        /// WebVTT class tag: `<c.yellow.bg_blue>`. The standard color classes
+        /// double as styling; every class is also recorded verbatim.
+        fn apply_vtt_classes(&mut self, rest: &str) {
+            for class in rest.trim().split('.').filter(|c| !c.is_empty()) {
+                if let Some(bg) = class.strip_prefix("bg_") {
+                    if let Some(c) = vtt_class_color(bg) {
+                        self.ctx.style.background = Some(c);
+                    }
+                } else if let Some(c) = vtt_class_color(class) {
+                    self.ctx.style.foreground = Some(c);
+                }
+                self.ctx.classes.push(class.to_owned());
+            }
+        }
+    }
+
+    /// The leading alphanumeric run of a tag body (`v Fred` -> `v`,
+    /// `c.yellow` -> `c`).
+    fn tag_name(tag: &str) -> String {
+        tag.chars()
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+
+    /// The WebVTT default color classes ("WebVTT cue text tracks display"),
+    /// the same eight colors browsers style `::cue(.<name>)` with.
+    fn vtt_class_color(name: &str) -> Option<Color> {
+        Some(match name {
+            "white" => Color::rgb(0xff, 0xff, 0xff),
+            "lime" => Color::rgb(0x00, 0xff, 0x00),
+            "cyan" => Color::rgb(0x00, 0xff, 0xff),
+            "red" => Color::rgb(0xff, 0x00, 0x00),
+            "yellow" => Color::rgb(0xff, 0xff, 0x00),
+            "magenta" => Color::rgb(0xff, 0x00, 0xff),
+            "blue" => Color::rgb(0x00, 0x00, 0xff),
+            "black" => Color::rgb(0x00, 0x00, 0x00),
+            _ => return None,
+        })
+    }
+
+    /// The pango `size` attribute: `1024`ths of a point, a named CSS size, or
+    /// a relative keyword.
+    fn parse_size(value: &str) -> Option<FontSize> {
+        let v = value.trim().to_ascii_lowercase();
+        // Steps of 1.2 around "medium", like pango's scale factors.
+        let scale = |steps: i32| FontSize::Scale(1.2f32.powi(steps));
+        Some(match v.as_str() {
+            "xx-small" => scale(-3),
+            "x-small" => scale(-2),
+            "small" | "smaller" => scale(-1),
+            "medium" => scale(0),
+            "large" | "larger" => scale(1),
+            "x-large" => scale(2),
+            "xx-large" => scale(3),
+            _ => {
+                if let Some(pt) = v.strip_suffix("pt") {
+                    FontSize::Points(pt.trim().parse::<f32>().ok()?)
+                } else {
+                    FontSize::Points(v.parse::<f32>().ok()? / 1024.0)
+                }
+            }
+        })
+    }
+
+    /// A pango font description like `Sans Bold 18` or just `12`: trailing
+    /// number = size in points, the (optional) rest = family.
+    fn parse_font_desc(value: &str) -> (Option<String>, Option<f32>) {
+        let value = value.trim();
+        if value.is_empty() {
+            return (None, None);
+        }
+        let (family, size) = match value.rsplit_once(char::is_whitespace) {
+            Some((head, tail)) => match tail.parse::<f32>() {
+                Ok(s) => (head.trim(), Some(s)),
+                Err(_) => (value, None),
+            },
+            None => match value.parse::<f32>() {
+                Ok(s) => ("", Some(s)),
+                Err(_) => (value, None),
+            },
+        };
+        let family = (!family.is_empty()).then(|| family.to_owned());
+        (family, size)
+    }
+
+    /// Iterator over `key="value"` / `key='value'` attribute pairs.
+    struct AttrIter<'a> {
+        rest: &'a str,
+    }
+
+    impl<'a> AttrIter<'a> {
+        fn new(rest: &'a str) -> Self {
+            AttrIter { rest }
+        }
+    }
+
+    impl Iterator for AttrIter<'_> {
+        type Item = (String, String);
+
+        fn next(&mut self) -> Option<(String, String)> {
+            loop {
+                let s = self.rest.trim_start();
+                if s.is_empty() {
+                    self.rest = s;
+                    return None;
+                }
+                let eq = s.find('=')?;
+                let key = s[..eq].trim();
+                let after = s[eq + 1..].trim_start();
+                let quote = after.chars().next()?;
+                if quote != '"' && quote != '\'' {
+                    // Malformed (unquoted) value: skip this token and go on.
+                    let skip = after.find(char::is_whitespace).unwrap_or(after.len());
+                    self.rest = &after[skip..];
+                    continue;
+                }
+                let close = after[1..].find(quote)?;
+                let value = &after[1..1 + close];
+                self.rest = &after[1 + close + 1..];
+                if key.is_empty() {
+                    continue;
+                }
+                return Some((key.to_owned(), value.to_owned()));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans_of(ir: &CueIr) -> Vec<&Span> {
+        ir.lines.iter().flat_map(|l| l.spans.iter()).collect()
+    }
+
+    // ---- colors ---------------------------------------------------------
+
+    #[test]
+    fn parses_hex_colors() {
+        assert_eq!(Color::parse("#ff0000"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(Color::parse("#f00"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(Color::parse("#123456"), Some(Color::rgb(0x12, 0x34, 0x56)));
+        assert_eq!(
+            Color::parse("#ffffffffffff"),
+            Some(Color::rgb(255, 255, 255))
+        );
+        assert_eq!(Color::parse("#12345"), None);
+        assert_eq!(Color::parse("#nothex"), None);
+    }
+
+    /// `named_color` binary-searches the table, which is only correct while
+    /// the table is strictly sorted.
+    #[test]
+    fn named_color_table_is_sorted() {
+        for pair in NAMED_COLORS.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "NAMED_COLORS out of order: {:?} before {:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    #[test]
+    fn parses_named_colors_case_insensitively() {
+        assert_eq!(Color::parse("red"), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(Color::parse("Yellow"), Some(Color::rgb(255, 255, 0)));
+        assert_eq!(
+            Color::parse("LightSlateGrey"),
+            Some(Color::rgb(119, 136, 153))
+        );
+        assert_eq!(Color::parse("notacolor"), None);
+    }
+
+    // ---- plain text -------------------------------------------------------
+
+    #[test]
+    fn plain_text_round_trips() {
+        let ir = CueIr::from_plain_text("One\nTwo");
+        assert_eq!(ir.lines.len(), 2);
+        assert_eq!(ir.plain_text(), "One\nTwo");
+        assert!(ir.lines[0].spans[0].style.is_plain());
+    }
+
+    #[test]
+    fn plain_text_keeps_empty_lines() {
+        let ir = CueIr::from_plain_text("a\n\nb");
+        assert_eq!(ir.lines.len(), 3);
+        assert!(ir.lines[1].spans.is_empty());
+        assert_eq!(ir.plain_text(), "a\n\nb");
+    }
+
+    // ---- subrip / mpl2 / webvtt tags ---------------------------------------
+
+    #[test]
+    fn simple_tags_map_to_styles() {
+        let ir = CueIr::from_pango_markup("<i>it</i><b>bo</b><u>un</u>");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].style.font_style, Some(FontStyle::Italic));
+        assert_eq!(spans[1].style.font_weight, Some(700));
+        assert_eq!(spans[2].style.underline, Some(true));
+        assert_eq!(ir.plain_text(), "itboun");
+    }
+
+    #[test]
+    fn nested_tags_compose() {
+        let ir = CueIr::from_pango_markup("<b><i>x</i>y</b>");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].style.font_weight, Some(700));
+        assert_eq!(spans[0].style.font_style, Some(FontStyle::Italic));
+        assert_eq!(spans[1].style.font_weight, Some(700));
+        assert_eq!(spans[1].style.font_style, None);
+    }
+
+    #[test]
+    fn unclosed_tags_close_at_the_end() {
+        let ir = CueIr::from_pango_markup("<i>Seven");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn stray_closers_are_ignored() {
+        let ir = CueIr::from_pango_markup("</b>text</i>");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].style.is_plain());
+        assert_eq!(spans[0].text, "text");
+    }
+
+    #[test]
+    fn entities_are_decoded() {
+        let ir = CueIr::from_pango_markup("Rock &amp; Roll &lt;5 &#x41;&#66;");
+        assert_eq!(ir.plain_text(), "Rock & Roll <5 AB");
+    }
+
+    #[test]
+    fn adjacent_identical_styling_merges() {
+        let ir = CueIr::from_pango_markup("a<unknowntag>b</unknowntag>c");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "abc");
+    }
+
+    #[test]
+    fn newlines_split_lines_across_open_tags() {
+        let ir = CueIr::from_pango_markup("<i>a\nb</i>");
+        assert_eq!(ir.lines.len(), 2);
+        assert_eq!(
+            ir.lines[0].spans[0].style.font_style,
+            Some(FontStyle::Italic)
+        );
+        assert_eq!(
+            ir.lines[1].spans[0].style.font_style,
+            Some(FontStyle::Italic)
+        );
+        assert_eq!(ir.plain_text(), "a\nb");
+    }
+
+    // ---- microdvd -----------------------------------------------------------
+
+    #[test]
+    fn microdvd_span_attrs() {
+        let ir = CueIr::from_pango_markup(
+            "<span style=\"italic\" weight=\"bold\" size=\"20000\">Hi</span>",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.font_style, Some(FontStyle::Italic));
+        assert_eq!(spans[0].style.font_weight, Some(700));
+        assert_eq!(
+            spans[0].style.font_size,
+            Some(FontSize::Points(20000.0 / 1024.0))
+        );
+    }
+
+    // ---- sami ---------------------------------------------------------------
+
+    #[test]
+    fn sami_foreground_and_family() {
+        let ir = CueIr::from_pango_markup(
+            "<span foreground=\"#00ffff\" font_family=\"Arial\">Hi</span>",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, Some(Color::rgb(0, 255, 255)));
+        assert_eq!(spans[0].style.font_family.as_deref(), Some("Arial"));
+    }
+
+    #[test]
+    fn sami_named_foreground() {
+        let ir = CueIr::from_pango_markup("<span foreground=\"red\">Red</span>");
+        assert_eq!(
+            spans_of(&ir)[0].style.foreground,
+            Some(Color::rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn sami_ruby_shape_maps_rise_and_size() {
+        // What the SAMI parser emits for <rt> annotations.
+        let ir = CueIr::from_pango_markup("<span size='xx-small' rise='-100'> anno </span>\nbase");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].text, " anno ");
+        assert_eq!(
+            spans[0].style.font_size,
+            Some(FontSize::Scale(1.2f32.powi(-3)))
+        );
+        assert_eq!(spans[0].style.baseline_shift, Some(-100.0 / 1024.0));
+        assert_eq!(spans[1].text, "base");
+    }
+
+    // ---- qttext ---------------------------------------------------------------
+
+    #[test]
+    fn qttext_font_desc_and_colors() {
+        let ir = CueIr::from_pango_markup(
+            "<span font='Arial 20' bgcolor='#000000' color='#FFFF00' weight='bold'>All</span>",
+        );
+        let s = &spans_of(&ir)[0].style;
+        assert_eq!(s.font_family.as_deref(), Some("Arial"));
+        assert_eq!(s.font_size, Some(FontSize::Points(20.0)));
+        assert_eq!(s.background, Some(Color::rgb(0, 0, 0)));
+        assert_eq!(s.foreground, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(s.font_weight, Some(700));
+    }
+
+    #[test]
+    fn qttext_bare_numeric_font_is_a_size() {
+        let ir = CueIr::from_pango_markup("<span font='12'>X</span>");
+        let s = &spans_of(&ir)[0].style;
+        assert_eq!(s.font_family, None);
+        assert_eq!(s.font_size, Some(FontSize::Points(12.0)));
+    }
+
+    // ---- webvtt voice / class / ruby -------------------------------------------
+
+    #[test]
+    fn vtt_voice_is_attributed() {
+        let ir = CueIr::from_pango_markup("<v Fred>Hi there");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].voice.as_deref(), Some("Fred"));
+        assert_eq!(spans[0].text, "Hi there");
+    }
+
+    #[test]
+    fn vtt_color_classes_style_and_record() {
+        let ir = CueIr::from_pango_markup("<c.yellow.bg_blue>warn</c>done");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, Some(Color::rgb(255, 255, 0)));
+        assert_eq!(spans[0].style.background, Some(Color::rgb(0, 0, 255)));
+        assert_eq!(spans[0].classes, vec!["yellow", "bg_blue"]);
+        assert!(spans[1].style.is_plain());
+    }
+
+    #[test]
+    fn vtt_ruby_annotation_attaches_to_base() {
+        let ir = CueIr::from_pango_markup("<ruby>base<rt>anno</rt></ruby>tail");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].text, "base");
+        assert_eq!(
+            spans[0].ruby,
+            Some(Ruby {
+                text: "anno".to_owned(),
+                position: RubyPosition::Over
+            })
+        );
+        assert_eq!(spans[1].text, "tail");
+        assert!(spans[1].ruby.is_none());
+        // Annotation text is not part of the plain text.
+        assert_eq!(ir.plain_text(), "basetail");
+    }
+
+    #[test]
+    fn vtt_unclosed_ruby_still_attaches() {
+        let ir = CueIr::from_pango_markup("<ruby>base<rt>anno");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].text, "base");
+        assert_eq!(
+            spans[0].ruby.as_ref().map(|r| r.text.as_str()),
+            Some("anno")
+        );
+    }
+
+    // ---- cue settings ------------------------------------------------------------
+
+    #[test]
+    fn cue_settings_fold_into_layout() {
+        let cue = Cue {
+            start_ns: 0,
+            end_ns: Some(1),
+            text: "x".to_owned(),
+            settings: CueSettings {
+                line_position: Some(10),
+                text_position: Some(50),
+                text_size: Some(35),
+                vertical: Some("vertical-lr".to_owned()),
+                alignment: Some("middle".to_owned()),
+            },
+        };
+        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup);
+        assert_eq!(ir.layout.line, Some(LinePosition::Percent(10.0)));
+        assert_eq!(ir.layout.position, Some(50.0));
+        assert_eq!(ir.layout.size, Some(35.0));
+        assert_eq!(ir.layout.writing_mode, WritingMode::VerticalLr);
+        assert_eq!(ir.layout.align, Some(TextAlign::Center));
+    }
+
+    #[test]
+    fn cue_to_ir_trims_trailing_newlines() {
+        let cue = Cue::new(0, Some(1), "One\n\n");
+        let ir = cue_to_ir(&cue, OutputFormat::Utf8);
+        assert_eq!(ir.lines.len(), 1);
+        assert_eq!(ir.plain_text(), "One");
+    }
+
+    // ---- ir plain text matches the element's strip ---------------------------------
+
+    #[test]
+    fn markup_plain_text_matches_strip_semantics() {
+        // The same inputs subparse's strip_pango_markup handles.
+        assert_eq!(CueIr::from_pango_markup("<i>Six</i>").plain_text(), "Six");
+        assert_eq!(
+            CueIr::from_pango_markup("gave <i>Rock &amp; Roll</i> to").plain_text(),
+            "gave Rock & Roll to"
+        );
+        assert_eq!(
+            CueIr::from_pango_markup("a &lt; b &unknown; &#177;").plain_text(),
+            format!("a < b &unknown; {}", char::from_u32(177).unwrap())
+        );
+    }
+}

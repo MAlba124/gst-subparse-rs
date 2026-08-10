@@ -43,8 +43,10 @@ use gst::subclass::prelude::*;
 use std::sync::{LazyLock, Mutex};
 
 use subparse_formats::formats::ssa::dialogue_to_pango_markup;
+use subparse_formats::ir::{self, CueIr};
 use subparse_formats::{Format, ParseContext, SubtitleFormat};
 
+use crate::cueir::{CueIrMeta, TextFormat};
 use crate::encoding::Decoder;
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -61,6 +63,14 @@ const INIT_HEADER: &[u8] = b"[Script Info]";
 
 /// The UTF-8 byte-order mark, skipped at the head of the init section.
 const BOM_UTF8: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// See [`crate::cueir::TextFormat`]; read when the src caps are chosen.
+const PROP_TEXT_FORMAT: &str = "text-format";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Settings {
+    text_format: TextFormat,
+}
 
 struct State {
     /// Container-framed input: one dialogue field row per buffer, timed by the
@@ -81,6 +91,11 @@ struct State {
     parser: Option<Box<dyn SubtitleFormat + Send>>,
 
     negotiated: bool,
+    /// Whether `text-format=cue-ir` was in effect when the caps were chosen:
+    /// buffers carry plain text plus a [`CueIrMeta`]. Latched with
+    /// `negotiated` so a mid-stream property change cannot contradict the
+    /// caps, and it survives whatever `negotiated` survives.
+    ir_mode: bool,
     segment: gst::FormattedSegment<gst::ClockTime>,
     segment_seqnum: Option<gst::Seqnum>,
     need_segment: bool,
@@ -101,6 +116,7 @@ impl Default for State {
             textbuf: String::new(),
             parser: None,
             negotiated: false,
+            ir_mode: false,
             segment: gst::FormattedSegment::new(),
             segment_seqnum: None,
             need_segment: true,
@@ -171,6 +187,7 @@ pub struct SsaParse {
     srcpad: gst::Pad,
     sinkpad: gst::Pad,
     state: Mutex<State>,
+    settings: Mutex<Settings>,
 }
 
 impl SsaParse {
@@ -250,15 +267,22 @@ impl SsaParse {
     /// The C sends its caps from `setcaps` and its tag list from the first chain
     /// call. Both come from here instead, so a stream that never produces a cue
     /// never produces events either, and so the two modes cannot disagree.
-    fn pending_events(&self, state: &mut State) -> Vec<gst::Event> {
+    fn pending_events(&self, state: &mut State, text_format: TextFormat) -> Vec<gst::Event> {
         let mut events: Vec<gst::Event> = Vec::new();
 
         if !state.negotiated {
+            // In cue-ir mode the buffer text is plain; styling travels in the
+            // CueIrMeta.
+            let format = match text_format {
+                TextFormat::PangoMarkup => "pango-markup",
+                TextFormat::CueIr => "utf8",
+            };
             let caps = gst::Caps::builder("text/x-raw")
-                .field("format", "pango-markup")
+                .field("format", format)
                 .build();
             events.push(gst::event::Caps::new(&caps));
             state.negotiated = true;
+            state.ir_mode = text_format == TextFormat::CueIr;
 
             if state.need_segment {
                 events.push(
@@ -311,14 +335,16 @@ impl SsaParse {
             gst::FlowError::Error
         })?;
 
-        let (events, text) = {
+        // Settings before state, the order every other site uses.
+        let text_format = self.settings.lock().unwrap().text_format;
+        let (events, text, ir_mode) = {
             let mut state = self.state.lock().unwrap();
             if state.flushing {
                 return Err(gst::FlowError::Flushing);
             }
-            let events = self.pending_events(&mut state);
+            let events = self.pending_events(&mut state, text_format);
             let text = decode_frame(&mut state, map.as_slice());
-            (events, text)
+            (events, text, state.ir_mode)
         };
 
         // The row is one line and its terminator is not part of the text. The C
@@ -372,12 +398,21 @@ impl SsaParse {
 
         // The trailing-newline rule again: `\N` at the end of a row translates
         // to " \n".
-        let markup = markup.trim_end_matches(['\n', '\r']).to_owned();
-        let mut buffer = gst::Buffer::from_slice(markup.into_bytes());
+        let markup = markup.trim_end_matches(['\n', '\r']);
+        let (text, cue_ir) = if ir_mode {
+            let cue_ir = CueIr::from_pango_markup(markup);
+            (cue_ir.plain_text(), Some(cue_ir))
+        } else {
+            (markup.to_owned(), None)
+        };
+        let mut buffer = gst::Buffer::from_slice(text.into_bytes());
         {
             let buf = buffer.get_mut().unwrap();
             buf.set_pts(pts);
             buf.set_duration(duration);
+            if let Some(cue_ir) = cue_ir {
+                CueIrMeta::add(buf, cue_ir);
+            }
         }
         gst::log!(
             CAT,
@@ -391,6 +426,8 @@ impl SsaParse {
 
     /// Whole-file mode: parse the accumulated `[Events]` body and push its cues.
     fn process(&self, at_eos: bool) -> Result<gst::FlowSuccess, gst::FlowError> {
+        // Settings before state, the order every other site uses.
+        let text_format = self.settings.lock().unwrap().text_format;
         let mut state = self.state.lock().unwrap();
 
         if state.flushing {
@@ -403,7 +440,7 @@ impl SsaParse {
             state.drained = true;
         }
 
-        let events = self.pending_events(&mut state);
+        let events = self.pending_events(&mut state, text_format);
 
         // Parse whatever forms complete `Dialogue:` lines, then drop the prefix
         // the parser is done with. The drain is what keeps this linear.
@@ -438,9 +475,17 @@ impl SsaParse {
         }
         state.textbuf.drain(..consumed);
 
+        let ir_mode = state.ir_mode;
         let mut buffers: Vec<gst::Buffer> = Vec::new();
         for cue in &parsed.cues {
-            let text = cue.text.trim_end_matches(['\n', '\r']).to_owned();
+            let (text, cue_ir) = if ir_mode {
+                // The whole-file parser emits pango-markup flavoured text
+                // (escaped plain text today, see `formats::ssa`).
+                let cue_ir = ir::cue_to_ir(cue, subparse_formats::OutputFormat::PangoMarkup);
+                (cue_ir.plain_text(), Some(cue_ir))
+            } else {
+                (cue.text.trim_end_matches(['\n', '\r']).to_owned(), None)
+            };
             let mut buffer = gst::Buffer::from_slice(text.into_bytes());
             {
                 let buf = buffer.get_mut().unwrap();
@@ -452,6 +497,9 @@ impl SsaParse {
                     && let Some(end) = crate::subparse::imp::clock_time(end_ns)
                 {
                     buf.set_duration(end.saturating_sub(start));
+                }
+                if let Some(cue_ir) = cue_ir {
+                    CueIrMeta::add(buf, cue_ir);
                 }
             }
             buffers.push(buffer);
@@ -558,8 +606,10 @@ impl SsaParse {
             EventView::FlushStop(_) => {
                 let mut state = self.state.lock().unwrap();
                 let negotiated = state.negotiated;
+                let ir_mode = state.ir_mode;
                 state.restart();
                 state.negotiated = negotiated;
+                state.ir_mode = ir_mode;
                 drop(state);
                 gst::Pad::event_default(pad, Some(&*self.obj()), event)
             }
@@ -600,11 +650,51 @@ impl ObjectSubclass for SsaParse {
             srcpad,
             sinkpad,
             state: Mutex::new(State::default()),
+            settings: Mutex::new(Settings::default()),
         }
     }
 }
 
 impl ObjectImpl for SsaParse {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
+            vec![
+                glib::ParamSpecEnum::builder_with_default(PROP_TEXT_FORMAT, TextFormat::default())
+                    .nick("Text format")
+                    .blurb(
+                        "How styling is delivered: pango-markup puts it inline in \
+                     the buffer text (the classic ssaparse behaviour), cue-ir \
+                     pushes plain UTF-8 text with a CueIrMeta carrying \
+                     structured styling for custom renderers. Read when the \
+                     src caps are chosen, so set it before starting.",
+                    )
+                    .mutable_ready()
+                    .build(),
+            ]
+        });
+        PROPERTIES.as_ref()
+    }
+
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        match pspec.name() {
+            PROP_TEXT_FORMAT => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.text_format = value.get().expect("type checked upstream");
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            PROP_TEXT_FORMAT => {
+                let settings = self.settings.lock().unwrap();
+                settings.text_format.to_value()
+            }
+            _ => unimplemented!(),
+        }
+    }
+
     fn constructed(&self) {
         self.parent_constructed();
 
@@ -644,8 +734,10 @@ impl ElementImpl for SsaParse {
             )
             .unwrap();
 
+            // The C advertises pango-markup only; utf8 is what `text-format=cue-ir`
+            // pushes (plain text plus a CueIrMeta).
             let src_caps = gst::Caps::builder("text/x-raw")
-                .field("format", "pango-markup")
+                .field("format", gst::List::new(["pango-markup", "utf8"]))
                 .build();
             let src_pad_template = gst::PadTemplate::new(
                 "src",

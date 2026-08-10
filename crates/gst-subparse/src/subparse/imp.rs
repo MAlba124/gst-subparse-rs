@@ -42,8 +42,9 @@ use gst::subclass::prelude::*;
 
 use std::sync::{LazyLock, Mutex};
 
-use subparse_formats::{Format, OutputFormat, ParseContext, SubtitleFormat, autodetect};
+use subparse_formats::{Format, OutputFormat, ParseContext, SubtitleFormat, autodetect, ir};
 
+use crate::cueir::{CueIrMeta, TextFormat};
 use crate::encoding::Decoder;
 
 static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -103,6 +104,10 @@ const PROP_ENCODING_ALIAS: &str = "encoding";
 /// by this name on whatever parser they plugged in, so any other spelling is
 /// unreachable from a real pipeline.
 const PROP_VIDEO_FPS: &str = "video-fps";
+/// How styling is delivered: inline pango markup (default, the C behaviour)
+/// or plain text plus a [`CueIrMeta`]. Read at negotiation time, so it has to
+/// be set before the element leaves READY.
+const PROP_TEXT_FORMAT: &str = "text-format";
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -112,6 +117,8 @@ struct Settings {
     /// The `video-fps` used by frame-based formats (MicroDVD) as a default.
     fps_n: u32,
     fps_d: u32,
+    /// The [`PROP_TEXT_FORMAT`] property.
+    text_format: TextFormat,
 }
 
 impl Default for Settings {
@@ -120,6 +127,7 @@ impl Default for Settings {
             encoding: None,
             fps_n: DEFAULT_FPS_N,
             fps_d: DEFAULT_FPS_D,
+            text_format: TextFormat::default(),
         }
     }
 }
@@ -149,6 +157,10 @@ struct State {
     output_format: OutputFormat,
     /// Whether downstream wants plain utf8 while our format is pango-markup.
     strip_pango_markup: bool,
+    /// Whether `text-format=cue-ir` was in effect when the caps were chosen:
+    /// buffers carry plain text plus a [`CueIrMeta`]. Latched at negotiation
+    /// so a mid-stream property change cannot contradict the caps.
+    ir_mode: bool,
     /// Whether the src caps have been chosen (and are in [`State::caps`]).
     negotiated: bool,
     /// The negotiated src caps, kept so the caps event can be built again: a
@@ -191,6 +203,7 @@ impl State {
             parser: None,
             output_format: OutputFormat::Utf8,
             strip_pango_markup: false,
+            ir_mode: false,
             negotiated: false,
             caps: None,
             need_caps_tags: true,
@@ -369,13 +382,17 @@ impl SubParse {
         allow(unreachable_code, unused_variables)
     )]
     fn process(&self, at_eos: bool) -> Result<gst::FlowSuccess, gst::FlowError> {
-        // Only the EOS drain below needs the property, and it must be read
-        // BEFORE the state lock is taken: every site that wants both takes them
-        // in that order, and they are only deadlock-free while that holds.
-        let fallback = if at_eos {
-            self.settings.lock().unwrap().encoding.clone()
-        } else {
-            None
+        // The properties must be read BEFORE the state lock is taken: every
+        // site that wants both takes them in that order, and they are only
+        // deadlock-free while that holds. Only the EOS drain needs `encoding`.
+        let (fallback, text_format) = {
+            let settings = self.settings.lock().unwrap();
+            let fallback = if at_eos {
+                settings.encoding.clone()
+            } else {
+                None
+            };
+            (fallback, settings.text_format)
         };
         let mut state = self.state.lock().unwrap();
 
@@ -493,7 +510,7 @@ impl SubParse {
         //    are really out, see `push_pending_events`.
         if !state.negotiated {
             let output = state.output_format;
-            let (caps, strip) = match self.negotiate(output) {
+            let (caps, strip) = match self.negotiate(output, text_format) {
                 Some(v) => v,
                 None => {
                     gst::element_imp_error!(
@@ -505,6 +522,7 @@ impl SubParse {
                 }
             };
             state.strip_pango_markup = strip;
+            state.ir_mode = text_format == TextFormat::CueIr;
             state.caps = Some(caps);
             state.negotiated = true;
         }
@@ -546,6 +564,7 @@ impl SubParse {
         state.textbuf.drain(..consumed);
 
         let strip = state.strip_pango_markup;
+        let ir_mode = state.ir_mode;
         let output = state.output_format;
         let seg_start = state.segment.start();
 
@@ -563,10 +582,18 @@ impl SubParse {
                 continue;
             }
 
-            let mut text = cue.text.clone();
-            if strip && output == OutputFormat::PangoMarkup {
-                text = strip_pango_markup(&text);
-            }
+            // In cue-ir mode the payload is the IR's own plain text, so the
+            // buffer text and the meta can never disagree about the content.
+            let (text, cue_ir) = if ir_mode {
+                let cue_ir = ir::cue_to_ir(cue, output);
+                (cue_ir.plain_text(), Some(cue_ir))
+            } else {
+                let mut text = cue.text.clone();
+                if strip && output == OutputFormat::PangoMarkup {
+                    text = strip_pango_markup(&text);
+                }
+                (text, None)
+            };
             // Never emit trailing newlines (the C strips them too).
             let text = text.trim_end_matches(['\n', '\r']).to_owned();
 
@@ -580,6 +607,9 @@ impl SubParse {
                     && let Some(end) = clock_time(end_ns)
                 {
                     buf.set_duration(end.saturating_sub(start));
+                }
+                if let Some(cue_ir) = cue_ir {
+                    CueIrMeta::add(buf, cue_ir);
                 }
             }
             buffers.push((buffer, cue_start));
@@ -674,8 +704,17 @@ impl SubParse {
 
     /// Choose the src caps and whether to strip pango markup, mirroring the C
     /// `gst_sub_parse_negotiate`.
-    fn negotiate(&self, output: OutputFormat) -> Option<(gst::Caps, bool)> {
-        let fmt = format_field(output);
+    fn negotiate(
+        &self,
+        output: OutputFormat,
+        text_format: TextFormat,
+    ) -> Option<(gst::Caps, bool)> {
+        // In cue-ir mode the buffer text is always plain (styling travels in
+        // the meta), whatever flavour the parser emits.
+        let fmt = match text_format {
+            TextFormat::CueIr => "utf8",
+            TextFormat::PangoMarkup => format_field(output),
+        };
         let preferred = gst::Caps::builder("text/x-raw")
             .field("format", fmt)
             .build();
@@ -715,6 +754,7 @@ impl SubParse {
         let negotiated = state.negotiated;
         let caps = state.caps.take();
         let strip = state.strip_pango_markup;
+        let ir_mode = state.ir_mode;
         let output = state.output_format;
         let segment = state.segment.clone();
         let segment_seqnum = state.segment_seqnum;
@@ -732,6 +772,7 @@ impl SubParse {
         state.negotiated = negotiated;
         state.caps = caps;
         state.strip_pango_markup = strip;
+        state.ir_mode = ir_mode;
         state.output_format = output;
         // The segment also survives (the C's FLUSH_STOP resets nothing): a
         // seek stores its target segment here, the seek's flush must not
@@ -1112,6 +1153,17 @@ impl ObjectImpl for SubParse {
                     ))
                     .readwrite()
                     .build(),
+                glib::ParamSpecEnum::builder_with_default(PROP_TEXT_FORMAT, TextFormat::default())
+                    .nick("Text format")
+                    .blurb(
+                        "How styling is delivered: pango-markup puts it inline in \
+                     the buffer text (the classic subparse behaviour), cue-ir \
+                     pushes plain UTF-8 text with a CueIrMeta carrying \
+                     structured styling for custom renderers. Read when the \
+                     src caps are chosen, so set it before starting.",
+                    )
+                    .mutable_ready()
+                    .build(),
             ]
         });
         PROPERTIES.as_ref()
@@ -1139,6 +1191,10 @@ impl ObjectImpl for SubParse {
                 let mut state = self.state.lock().unwrap();
                 state.fps = (fps_n, fps_d);
             }
+            PROP_TEXT_FORMAT => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.text_format = value.get().expect("type checked upstream");
+            }
             _ => unimplemented!(),
         }
     }
@@ -1152,6 +1208,10 @@ impl ObjectImpl for SubParse {
             PROP_VIDEO_FPS => {
                 let settings = self.settings.lock().unwrap();
                 gst::Fraction::new(settings.fps_n as i32, settings.fps_d as i32).to_value()
+            }
+            PROP_TEXT_FORMAT => {
+                let settings = self.settings.lock().unwrap();
+                settings.text_format.to_value()
             }
             _ => unimplemented!(),
         }

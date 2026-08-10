@@ -16,6 +16,7 @@ pub mod autodetect;
 pub mod cue;
 pub mod format;
 pub mod formats;
+pub mod ir;
 
 pub use cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};
 pub use format::{Format, LineScanner, Parsed, SubtitleFormat, parse_with};

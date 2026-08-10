@@ -15,16 +15,28 @@
 //! crate. This crate only wraps them in GStreamer elements (buffering, charset
 //! decoding, caps negotiation, seeking, EOS handling).
 //!
+//! Both elements have a `text-format` property. The default (`pango-markup`)
+//! is the C behaviour: styling inline in the buffer text. `cue-ir` instead
+//! pushes plain UTF-8 text with a [`cueir::CueIrMeta`] attached, whose payload
+//! is the plain-old-data [`subparse_formats::ir::CueIr`] struct, for custom
+//! renderers (see [`cueir`]).
+//!
 //! The element structure is modeled on gst-plugins-rs' `closedcaption`
 //! `scc_parse`/`mcc_parse` elements.
 
 use gst::glib;
 
+pub mod cueir;
 mod encoding;
 #[cfg(feature = "ssa")]
 mod ssaparse;
 pub(crate) mod subparse;
 mod typefind;
+
+// Re-exported so an application reading `CueIrMeta` off a buffer can name the
+// IR types without adding (and version-matching) its own `subparse-formats`
+// dependency.
+pub use subparse_formats;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     subparse::register(plugin)?;

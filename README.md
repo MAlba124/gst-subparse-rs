@@ -11,4 +11,20 @@ elements, so it can be installed alongside the C plugin.
 
 See [specs/](specs/) for the in-tree format references.
 
+## Cue IR for custom renderers
+
+Both elements have a `text-format` property. The default (`pango-markup`)
+matches the C plugin: styling inline in the buffer text. Setting it to
+`cue-ir` instead pushes plain UTF-8 text (`text/x-raw, format=utf8`) with a
+`CueIrMeta` attached to every buffer, whose payload is the plain-old-data
+`subparse_formats::ir::CueIr` struct (styled spans, colors, fonts,
+positioning). A custom renderer — e.g. one built on `parley` + `vello_cpu` —
+links `gst-subparse` as an rlib and reads the IR straight off the buffer:
+
+```rust
+if let Some(meta) = buffer.meta::<gstrssubparse::cueir::CueIrMeta>() {
+    render(meta.ir()); // spans, colors, layout — no markup parsing
+}
+```
+
 License: LGPL-2.1-or-later (matches upstream subparse).
