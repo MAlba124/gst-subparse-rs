@@ -27,4 +27,10 @@ if let Some(meta) = buffer.meta::<gstrssubparse::cueir::CueIrMeta>() {
 }
 ```
 
+[crates/cueir-demo](crates/cueir-demo/) is a runnable end-to-end demo of
+exactly that (a standalone crate, not a workspace member): it pipes a subtitle
+file through `rssubparse text-format=cue-ir` and renders each cue to a PNG
+with parley + vello_cpu. Its `renderer.rs` is the starting point for the fcast
+receiver's subtitle renderer.
+
 License: LGPL-2.1-or-later (matches upstream subparse).

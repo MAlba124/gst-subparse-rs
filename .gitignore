@@ -5,3 +5,6 @@
 /fuzz/artifacts
 /fuzz/coverage
 /fuzz/Cargo.lock
+# cueir-demo is a standalone crate with its own target dir and render output.
+/crates/cueir-demo/target
+/crates/cueir-demo/cueir-demo-output

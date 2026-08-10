@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Marcus Hanestad <marlhan@proton.me>
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+[package]
+name = "cueir-demo"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+publish = false
+description = "Demo: render rssubparse text-format=cue-ir subtitles with parley + vello_cpu"
+
+# Deliberately NOT a member of the gst-subparse-rs workspace: the demo pulls in
+# the parley/vello_cpu rendering stack, which the plugin crates must stay free
+# of (subparse-formats is dependency-free by contract). Build it from this
+# directory: `cargo run -p cueir-demo` will not work from the repo root.
+[workspace]
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25" }
+gst-app = { package = "gstreamer-app", version = "0.25" }
+# The plugin package; its library target is `gstrssubparse`.
+gst-subparse = { path = "../gst-subparse" }
+subparse-formats = { path = "../subparse-formats" }
+parley = "0.11"
+peniko = "0.6"
+# The same revision the parley workspace pins vello_cpu to (its examples are
+# what this demo's rendering is modeled on).
+vello_cpu = { git = "https://github.com/linebender/vello.git", rev = "5796226", default-features = false, features = [
+    "std",
+    "png",
+    "text",
+    "u8_pipeline",
+] }
