@@ -313,16 +313,22 @@ pub fn cue_is_in_future(start_rt: gst::ClockTime, frame_rt: gst::ClockTime) -> b
 }
 
 /// The reveal steps of a cue, as running times: sorted, deduplicated, and
-/// anchored to `start_rt` by the pts the reveal times are absolute against.
-/// Empty when the cue has no karaoke (the common case) or no pts anchor.
+/// anchored to `start_rt` by the pts the reveal times are absolute against,
+/// scaled by the playback `rate` (reveal offsets are stream time; the
+/// engine's clock is running time). Empty when the cue has no karaoke (the
+/// common case), no pts anchor, or a non-forward rate.
 fn reveal_steps(
     ir: &CueIr,
     start_rt: gst::ClockTime,
     pts_start: Option<gst::ClockTime>,
+    rate: f64,
 ) -> Vec<gst::ClockTime> {
     let Some(pts) = pts_start else {
         return Vec::new();
     };
+    if rate.is_nan() || rate <= 0.0 {
+        return Vec::new();
+    }
     let mut steps: Vec<u64> = ir
         .lines
         .iter()
@@ -335,9 +341,14 @@ fn reveal_steps(
         .into_iter()
         .map(|ns| {
             // Offset from the cue's own start; a reveal at/before the start
-            // is step zero (visible immediately).
+            // is step zero (visible immediately). Reveal times come straight
+            // out of hostile subtitle files, so every operation here must be
+            // total: the saturating add can land on u64::MAX, which is
+            // GST_CLOCK_TIME_NONE and panics `from_nseconds`.
             let offset = ns.saturating_sub(pts.nseconds());
-            start_rt + gst::ClockTime::from_nseconds(offset)
+            let offset = (offset as f64 / rate) as u64; // saturating cast
+            let rt = start_rt.nseconds().saturating_add(offset).min(u64::MAX - 1);
+            gst::ClockTime::from_nseconds(rt)
         })
         .collect()
 }
@@ -468,6 +479,10 @@ struct State {
     /// Running time of the most recently shown frame. While paused this is
     /// frozen, and it is what a newly arriving cue is evaluated against.
     last_shown_rt: Option<gst::ClockTime>,
+    /// Orders raster requests by *state-lock* order: keys are computed under
+    /// the state lock but written to the worker inbox after it, so two
+    /// threads' writes can arrive inverted (see [`CueEngine::request_raster`]).
+    request_seq: u64,
 }
 
 type OnChange = Arc<dyn Fn() + Send + Sync>;
@@ -845,51 +860,67 @@ impl CueEngine {
         }
     }
 
-    /// Cache lookup for the active cue's raster. Returns the key to hand to
-    /// the worker (a miss, or a karaoke prefetch) and whether the active
-    /// raster was filled from cache. Must be called with `state` locked;
-    /// takes the cache lock underneath it, which is the only order this pair
-    /// is ever taken in.
-    fn resolve_raster(&self, state: &mut State) -> (Option<RasterKey>, bool) {
-        let Some(active) = state.active.as_mut() else {
-            return (None, false);
+    /// Cache lookup for the active cue's raster. Returns the sequenced key
+    /// to hand to the worker (a miss, or a karaoke prefetch) and whether the
+    /// active raster was filled from cache. Must be called with `state`
+    /// locked; takes the cache lock underneath it, which is the only order
+    /// this pair is ever taken in.
+    fn resolve_raster(&self, state: &mut State) -> (Option<(u64, RasterKey)>, bool) {
+        let (key, filled) = {
+            let Some(active) = state.active.as_mut() else {
+                return (None, false);
+            };
+            match active.raster {
+                RasterState::Pending => {
+                    if let Some(raster) = self.shared.cache.lock().get(&active.key) {
+                        active.raster = RasterState::Ready(raster);
+                        (None, true)
+                    } else {
+                        (Some(active.key.clone()), false)
+                    }
+                }
+                // Karaoke: while the current step shows, warm the next one so
+                // crossing a reveal threshold is a cache hit instead of a
+                // raster latency. `publish` files a prefetch under its own
+                // key without touching what is on screen. (Once cached, this
+                // is one short cache probe per frame, only for karaoke cues.)
+                RasterState::Ready(_) if active.key.step < active.steps.len() => {
+                    let next = RasterKey {
+                        step: active.key.step + 1,
+                        ..active.key.clone()
+                    };
+                    if self.shared.cache.lock().get(&next).is_none() {
+                        (Some(next), false)
+                    } else {
+                        (None, false)
+                    }
+                }
+                _ => (None, false),
+            }
         };
-        match active.raster {
-            RasterState::Pending => {
-                if let Some(raster) = self.shared.cache.lock().get(&active.key) {
-                    active.raster = RasterState::Ready(raster);
-                    (None, true)
-                } else {
-                    (Some(active.key.clone()), false)
-                }
+        match key {
+            Some(key) => {
+                state.request_seq += 1;
+                (Some((state.request_seq, key)), filled)
             }
-            // Karaoke: while the current step shows, warm the next one so
-            // crossing a reveal threshold is a cache hit instead of a raster
-            // latency. `publish` files a prefetch under its own key without
-            // touching what is on screen. (Once cached, this is one short
-            // cache probe per frame, only for karaoke cues.)
-            RasterState::Ready(_) if active.key.step < active.steps.len() => {
-                let next = RasterKey {
-                    step: active.key.step + 1,
-                    ..active.key.clone()
-                };
-                if self.shared.cache.lock().get(&next).is_none() {
-                    (Some(next), false)
-                } else {
-                    (None, false)
-                }
-            }
-            _ => (None, false),
+            None => (None, filled),
         }
     }
 
-    fn request_raster(&self, request: RasterKey) {
+    fn request_raster(&self, (seq, request): (u64, RasterKey)) {
         let inbox = self.worker_inbox();
         let mut slot = inbox.slot.lock();
-        // Latest-wins: an older outstanding request is for a cue that is no
-        // longer active, so nobody is waiting for it.
-        slot.request = Some((request, Instant::now()));
-        inbox.cv.notify_all();
+        // Newest-wins by *state-lock order*, not thread arrival order: the
+        // key was computed under the state lock but is written here after
+        // releasing it, so a preempted thread can deliver a stale key late.
+        // Without the sequence check it would clobber a newer request and —
+        // since `publish` rightly rejects the stale raster — leave the
+        // active cue Pending with an empty inbox: self-healing in one frame
+        // during playback, but stuck indefinitely while paused.
+        if slot.request.as_ref().is_none_or(|(s, ..)| *s < seq) {
+            slot.request = Some((seq, request, Instant::now()));
+            inbox.cv.notify_all();
+        }
     }
 
     /// The worker is spawned on first use — a sink that never shows a cue
@@ -966,14 +997,31 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
             if state.active.as_ref().is_some_and(|act| act.cue == cue) {
                 false
             } else {
-                let steps = reveal_steps(&cue.content.ir, cue.start_rt, cue.pts_start);
+                let rate = state.video_segment.as_ref().map_or(1.0, |s| s.rate());
+                let steps = reveal_steps(&cue.content.ir, cue.start_rt, cue.pts_start, rate);
+                let has_reveals = cue
+                    .content
+                    .ir
+                    .lines
+                    .iter()
+                    .flat_map(|l| l.spans.iter())
+                    .any(|s| s.reveal_ns.is_some());
+                // Timed spans without a usable anchor (no pts, non-forward
+                // rate): show the whole cue at once, per the documented
+                // `pts_start` contract — a pinned step of 0 used to hide
+                // them all instead.
+                let step = if steps.is_empty() && has_reveals {
+                    usize::MAX
+                } else {
+                    0
+                };
                 state.active = Some(Active {
                     key: RasterKey {
                         ir: cue.content.ir.clone(),
                         style: state.style.clone(),
                         canvas,
                         video_rect,
-                        step: 0,
+                        step,
                     },
                     steps,
                     cue,
@@ -1053,11 +1101,13 @@ impl RasterCache {
 
 #[derive(Default)]
 struct Slot {
-    /// Latest-wins: only the newest request matters, older ones are stale by
-    /// construction. The key carries everything the worker needs (the IR it
-    /// depicts, the canvas, the reveal step); the instant is when the request
-    /// was made, so the worker can report what the wait cost.
-    request: Option<(RasterKey, Instant)>,
+    /// Newest-wins (by engine sequence number — see
+    /// [`CueEngine::request_raster`]): only the newest request matters,
+    /// older ones are stale by construction. The key carries everything the
+    /// worker needs (the IR it depicts, the canvas, the reveal step); the
+    /// instant is when the request was made, so the worker can report what
+    /// the wait cost.
+    request: Option<(u64, RasterKey, Instant)>,
     warm: bool,
     quit: bool,
 }
@@ -1111,7 +1161,7 @@ fn worker_main(shared: Weak<Shared>, inbox: Arc<Inbox>) {
             }
         }
 
-        let Some((request, requested_at)) = request else {
+        let Some((_seq, request, requested_at)) = request else {
             continue;
         };
         let Some(shared) = shared.upgrade() else {
@@ -1133,8 +1183,27 @@ fn worker_main(shared: Weak<Shared>, inbox: Arc<Inbox>) {
             continue;
         }
 
-        let ctx = ctx.get_or_insert_with(RasterCtx::new);
-        let raster = ctx.render(&request).map(Arc::new);
+        // A panic inside the render stack (parley/vello asserts, a geometry
+        // guard someone forgets) must not kill this thread: the handle would
+        // still be held, every future request would go to a dead worker, and
+        // subtitles would silently stop for the process lifetime. Convert
+        // panics into a Failed raster and rebuild the (possibly poisoned)
+        // contexts on the next request.
+        let rendered = {
+            let ctx = ctx.get_or_insert_with(RasterCtx::new);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.render(&request)))
+        };
+        let raster = match rendered {
+            Ok(raster) => raster.map(Arc::new),
+            Err(_) => {
+                warn!(
+                    step = request.step,
+                    "cue raster panicked; rebuilding the raster context"
+                );
+                ctx = None;
+                None
+            }
+        };
         record_raster_latency(&shared, requested_at.elapsed());
         if publish(&shared, request, raster) {
             let engine = CueEngine { shared };
@@ -1471,14 +1540,27 @@ impl RasterCtx {
         // (~3 standard deviations to fade out).
         let pad = reach.max(box_pad + 3.0 * box_soft).ceil() + 1.0;
 
-        let surface_w = ((ink_x1 - ink_x0).ceil() as i32) + 2 * pad as i32;
-        let surface_h = (lh.ceil() as i32) + 2 * pad as i32;
-        if surface_w > MAX_RASTER_PX || surface_h > MAX_RASTER_PX {
-            warn!(surface_w, surface_h, "cue raster too large, skipping");
+        // Everything above came from attacker-controlled f32s (IR sizes,
+        // spacing, shadow offsets), so validate in float space — where
+        // nothing has wrapped yet — before any integer cast. `as i32` on an
+        // overflowed value used to wrap past the size check and reach the
+        // `as u16` casts below as garbage (multi-GB pixmap allocations), or
+        // panic in debug builds. NaN fails these comparisons and is
+        // rejected too. Rejection must be a `Failed` cue, never a panic.
+        let surface_w = (ink_x1 - ink_x0).ceil() + 2.0 * pad;
+        let surface_h = lh.ceil() + 2.0 * pad;
+        if !(surface_w >= 1.0
+            && surface_h >= 1.0
+            && surface_w <= MAX_RASTER_PX as f32
+            && surface_h <= MAX_RASTER_PX as f32)
+        {
+            warn!(surface_w, surface_h, "cue raster size unusable, skipping");
             return None;
         }
+        let surface_w = surface_w as i32;
+        let surface_h = surface_h as i32;
 
-        let (mut rc, pixmap) = self.surface((surface_w as u16, surface_h as u16));
+        let (rc, pixmap) = self.surface((surface_w as u16, surface_h as u16));
         rc.set_transform(Affine::translate(Vec2::new(
             (pad - ink_x0) as f64,
             pad as f64,
@@ -1711,15 +1793,48 @@ fn place(
     let x = if let Some((ox, _)) = l.origin {
         frame.x + frame.w * ox / 100.0 - w * col
     } else if let Some(p) = l.position {
-        frame.x + frame.w * p / 100.0 - w / 2.0
+        // WebVTT position alignment: which edge of the cue box sits at the
+        // position. `Auto` (or unset) follows the text alignment, centered
+        // by default.
+        let at = match l.position_align {
+            Some(ir::PositionAlign::LineLeft) => 0.0,
+            Some(ir::PositionAlign::Center) => 0.5,
+            Some(ir::PositionAlign::LineRight) => 1.0,
+            Some(ir::PositionAlign::Auto) | None => match l.align {
+                Some(ir::TextAlign::Left | ir::TextAlign::Start) => 0.0,
+                Some(ir::TextAlign::Right | ir::TextAlign::End) => 1.0,
+                _ => 0.5,
+            },
+        };
+        frame.x + frame.w * p / 100.0 - w * at
     } else {
         // Centered on the picture (which is centered in the window anyway).
         frame.x + (frame.w - w) / 2.0
     };
     let y = if let Some((_, oy)) = l.origin {
         frame.y + frame.h * oy / 100.0 - h * row
-    } else if let Some(ir::LinePosition::Percent(p)) = l.line {
-        frame.y + frame.h * p / 100.0
+    } else if let Some(pos) = l.line {
+        let base = match pos {
+            ir::LinePosition::Percent(p) => frame.y + frame.h * p / 100.0,
+            // Snap-to-lines: the step is the cue's own line height.
+            // Non-negative counts from the frame's top edge; negative from
+            // the bottom, with the cue kept inside (`line:-1` = the last
+            // line, i.e. bottom-aligned). Used to fall through to the
+            // default bottom strip, putting `line:0` cues at the *bottom*.
+            ir::LinePosition::Line(n) => {
+                let line_h = h / ir.lines.len().max(1) as f32;
+                if n >= 0 {
+                    frame.y + line_h * n as f32
+                } else {
+                    frame.y + frame.h + line_h * (n + 1) as f32 - h
+                }
+            }
+        };
+        match l.line_align {
+            Some(ir::LineAlign::Center) => base - h / 2.0,
+            Some(ir::LineAlign::End) => base - h,
+            _ => base,
+        }
     } else {
         // Margin proportional to the picture, applied to the frame or —
         // for unpositioned cues under the window-margins policy — to the
@@ -1797,12 +1912,20 @@ fn pt_to_px(pt: f32) -> f32 {
 
 /// IR font size → pixels: absolute points via the CSS factor, scales against
 /// the house base size, frame-height percents (SSA) against the canvas.
+/// IR values are attacker-controlled f32s (a CSS `font-size: NaN%` parses),
+/// so the result is clamped to something a raster can hold, and anything
+/// non-finite falls back to the base size.
 fn font_px(size: Option<ir::FontSize>, base_px: f32, canvas_h: f32) -> f32 {
-    match size {
+    let px = match size {
         Some(ir::FontSize::Points(pt)) => pt_to_px(pt),
         Some(ir::FontSize::Scale(s)) => base_px * s,
         Some(ir::FontSize::FrameHeightPercent(p)) => canvas_h * p / 100.0,
         None => base_px,
+    };
+    if px.is_finite() {
+        px.clamp(1.0, MAX_RASTER_PX as f32)
+    } else {
+        base_px
     }
 }
 
@@ -2291,6 +2414,164 @@ mod tests {
                 assert_eq!(out[3], alpha as u8);
             }
         }
+    }
+
+    #[test]
+    fn hostile_reveal_times_do_not_panic() {
+        // Bug review #1: reveal_ns is attacker-controlled; u64::MAX is
+        // GST_CLOCK_TIME_NONE and used to assert inside from_nseconds on the
+        // submitting thread.
+        let mut ir = CueIr::from_plain_text("boom");
+        ir.lines[0].spans[0].reveal_ns = Some(u64::MAX);
+        let mut tail = ir.lines[0].spans[0].clone();
+        tail.text = " tail".into();
+        tail.reveal_ns = Some(u64::MAX - 1);
+        ir.lines[0].spans.push(tail);
+
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            // A large start_rt also used to overflow the running-time add.
+            start_rt: gst::ClockTime::from_seconds(u32::MAX as u64),
+            end_rt: None,
+            pts_start: Some(gst::ClockTime::ZERO),
+        });
+        engine.overlays_for(Some(gst::ClockTime::from_seconds(u32::MAX as u64)));
+        engine.current_overlays(); // must simply not panic
+    }
+
+    #[test]
+    fn pts_none_shows_the_whole_cue() {
+        // Bug review #2: the documented contract is "None disables stepping
+        // and shows the whole cue at once"; timed spans used to stay hidden
+        // forever instead.
+        let mut ir = CueIr::from_plain_text("first");
+        let mut second = ir.lines[0].spans[0].clone();
+        second.text = " second".into();
+        second.reveal_ns = Some(ms(500).nseconds());
+        ir.lines[0].spans.push(second);
+
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            start_rt: ms(0),
+            end_rt: None,
+            pts_start: None,
+        });
+        engine.overlays_for(Some(ms(100)));
+
+        let overlay = ready_overlay(&engine);
+        let painted = overlay
+            .pixels
+            .chunks_exact(4)
+            .filter(|px| px[3] > 0)
+            .count();
+        assert!(
+            painted > 50,
+            "timed spans must be visible, got {painted} px"
+        );
+    }
+
+    #[test]
+    fn absurd_style_values_fail_without_killing_the_worker() {
+        // Bug review #3: a huge shadow offset used to overflow the surface
+        // math (debug panic in the worker; wrapped garbage in release). It
+        // must become a Failed raster, and the worker must survive to serve
+        // the next cue.
+        let mut ir = CueIr::from_plain_text("evil");
+        ir.base.shadow = Some(subparse_formats::ir::Shadow {
+            color: IrColor::BLACK,
+            dx: 1e12,
+            dy: 0.0,
+            blur: 0.0,
+        });
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            start_rt: ms(0),
+            end_rt: Some(ms(1_000)),
+            pts_start: None,
+        });
+        engine.overlays_for(Some(ms(100)));
+        assert!(wait_for(|| {
+            matches!(
+                engine.shared.state.lock().active.as_ref(),
+                Some(Active {
+                    raster: RasterState::Failed,
+                    ..
+                })
+            )
+        }));
+
+        // The worker is still alive: an ordinary cue renders afterwards.
+        engine.overlays_for(Some(ms(1_000))); // expire the evil cue
+        engine.submit(cue("fine", 2_000, 1_000));
+        engine.overlays_for(Some(ms(2_100)));
+        ready_overlay(&engine);
+    }
+
+    #[test]
+    fn line_number_positioning() {
+        // Bug review #6: LinePosition::Line used to fall through to the
+        // bottom strip; line:0 means the frame's top.
+        let frame = Frame {
+            x: 0.0,
+            y: 0.0,
+            w: 640.0,
+            h: 360.0,
+        };
+        let style = CueStyle::default();
+        let mut ir = CueIr::from_plain_text("one line");
+        ir.layout.line = Some(subparse_formats::ir::LinePosition::Line(0));
+        let (_, y) = place(&ir, &style, (640.0, 360.0), frame, 100.0, 40.0);
+        assert_eq!(y, 0, "line:0 sits at the frame top");
+        ir.layout.line = Some(subparse_formats::ir::LinePosition::Line(-1));
+        let (_, y) = place(&ir, &style, (640.0, 360.0), frame, 100.0, 40.0);
+        assert_eq!(y, 320, "line:-1 is bottom-aligned");
+    }
+
+    #[test]
+    fn playback_rate_scales_reveal_times() {
+        // Bug review #7: reveal offsets are stream time; at 2x they must
+        // fire in half the running time.
+        let mut ir = CueIr::from_plain_text("la");
+        let mut second = ir.lines[0].spans[0].clone();
+        second.text = "la2".into();
+        second.reveal_ns = Some(ms(1_000).nseconds());
+        ir.lines[0].spans.push(second);
+
+        gst::init().unwrap();
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        let mut segment = gst::FormattedSegment::<gst::ClockTime>::new();
+        segment.set_rate(2.0);
+        engine.set_video_segment(segment.upcast_ref());
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            start_rt: ms(0),
+            end_rt: Some(ms(2_000)),
+            pts_start: Some(gst::ClockTime::ZERO),
+        });
+
+        // At 2x the +1000ms stream-time reveal lands at +500ms running time.
+        engine.overlays_for(Some(ms(400)));
+        let step_at = |engine: &CueEngine| {
+            engine
+                .shared
+                .state
+                .lock()
+                .active
+                .as_ref()
+                .expect("active cue")
+                .key
+                .step
+        };
+        assert_eq!(step_at(&engine), 0);
+        engine.overlays_for(Some(ms(600)));
+        assert_eq!(step_at(&engine), 1);
     }
 
     #[test]

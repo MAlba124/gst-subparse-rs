@@ -904,11 +904,17 @@ mod markup {
         for i in 0..9 {
             frac_ns = frac_ns * 10 + frac.as_bytes().get(i).map_or(0, |b| (b - b'0') as u64);
         }
-        Some(
-            (h.saturating_mul(3600) + m * 60 + sec)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(frac_ns),
-        )
+        // An absurd timestamp is prose, not a reveal marker: reject instead
+        // of saturating, so it stays literal text. Renderers turn reveal
+        // times into `GstClockTime`, whose `u64::MAX` is the NONE sentinel —
+        // a saturated value here used to panic a consumer downstream.
+        let ns = h
+            .checked_mul(3600)?
+            .checked_add(m.checked_mul(60)?)?
+            .checked_add(sec)?
+            .checked_mul(1_000_000_000)?
+            .checked_add(frac_ns)?;
+        (ns < u64::MAX).then_some(ns)
     }
 
     /// Decode one `&...;` reference starting at `input` (which begins with
@@ -1837,6 +1843,16 @@ mod tests {
             assert_eq!(s.style.foreground, Some(Color::rgb(255, 255, 0)));
             assert_eq!(s.classes, vec!["yellow"]);
         }
+    }
+
+    #[test]
+    fn absurd_inline_timestamps_stay_literal_text() {
+        // A saturating parse used to hand consumers u64::MAX, which is
+        // GST_CLOCK_TIME_NONE. Now it is not a timestamp at all.
+        let ir = CueIr::from_pango_markup("&lt;999999999:00:00.0&gt;x");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].reveal_ns, None);
+        assert_eq!(ir.plain_text(), "<999999999:00:00.0>x");
     }
 
     #[test]
