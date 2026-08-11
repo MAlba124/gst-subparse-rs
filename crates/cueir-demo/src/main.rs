@@ -24,6 +24,12 @@
 
 mod renderer;
 
+// The cue engine written for the fcast receiver (a drop-in replacement for
+// fcast-video/src/cue.rs, developed and tested here — see its module docs).
+// Nothing in the demo binary calls it; it exists to compile and be tested.
+#[allow(dead_code)]
+mod fcast_cue;
+
 use gst::prelude::*;
 use peniko::Color;
 use vello_cpu::{Pixmap, RenderContext, kurbo::Rect};

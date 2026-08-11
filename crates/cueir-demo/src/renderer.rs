@@ -224,10 +224,12 @@ impl CueRenderer {
                 .unwrap_or(6.0)
                 / 100.0
                 * fh;
-            match row {
-                r if r == 0.0 => mv,
-                r if r == 1.0 => fh - mv - lh,
-                _ => (fh - lh) / 2.0,
+            if row == 0.0 {
+                mv
+            } else if row == 1.0 {
+                fh - mv - lh
+            } else {
+                (fh - lh) / 2.0
             }
         }
         .clamp(0.0, (fh - lh).max(0.0));

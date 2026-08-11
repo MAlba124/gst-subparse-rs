@@ -23,6 +23,11 @@ gst-subparse = { path = "../gst-subparse" }
 subparse-formats = { path = "../subparse-formats" }
 parley = "0.11"
 peniko = "0.6"
+# Used only by `fcast_cue.rs` (the module written here for the fcast
+# receiver), so that file matches fcast-video's dependency set verbatim.
+parking_lot = "0.12"
+smallvec = "1"
+tracing = "0.1"
 # The same revision the parley workspace pins vello_cpu to (its examples are
 # what this demo's rendering is modeled on).
 vello_cpu = { git = "https://github.com/linebender/vello.git", rev = "5796226", default-features = false, features = [
