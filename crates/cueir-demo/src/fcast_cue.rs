@@ -26,6 +26,11 @@
 //! * **Karaoke works.** Spans carry absolute reveal times; the engine
 //!   re-keys the raster as the frame clock passes each step, so `\k`
 //!   syllables and WebVTT inline timestamps paint on progressively.
+//! * **The house style is configurable.** [`CueEngine::set_style`] takes a
+//!   [`CueStyle`] (font, outline, a rounded/feathered readability box —
+//!   see [`CueStyle::boxed`]) at any time, e.g. from a user settings menu;
+//!   the active cue re-rasters immediately, paused included. The subtitle's
+//!   own styling still overrides the corresponding house fields.
 //!
 //! ## Porting checklist (fcast side)
 //!
@@ -98,25 +103,109 @@ const PENDING_LIMIT: usize = 16;
 /// the steps of the active cue should not evict each other.
 const RASTER_CACHE_LIMIT: usize = 16;
 
-/// Layout constants, in one place (all derived from the window/canvas size,
-/// so cues are sized against the real display, not the video's coded size).
-/// These are the *house style*: the IR overrides each of them wherever the
-/// subtitle file says something explicit.
-mod layout {
+/// Refuse to allocate a raster larger than this in either dimension.
+const MAX_RASTER_PX: i32 = 8192;
+
+// -- house style ----------------------------------------------------------------
+
+/// Straight-alpha RGBA, toolkit-agnostic.
+pub type Rgba = [u8; 4];
+
+/// How cue text is presented when (and wherever) the subtitle file itself
+/// says nothing: the *house style*. Set it with [`CueEngine::set_style`] —
+/// e.g. from a user settings menu — and the active cue re-rasterizes.
+/// Everything the IR specifies (colors, fonts, per-cue outline/shadow,
+/// positioning) still overrides the corresponding field here.
+///
+/// All fractions of the font size are em-like (`0.5` = half the font size);
+/// the font size itself is a fraction of the canvas height, so cues scale
+/// with the real display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CueStyle {
+    /// Font family; `None` = the platform's sans-serif.
+    pub font_family: Option<String>,
+    /// CSS-style weight (400 normal, 700 bold).
+    pub font_weight: f32,
     /// Font size as a fraction of canvas height.
-    pub const FONT_HEIGHT_FRACTION: f32 = 0.045;
+    pub font_height_fraction: f32,
     /// Never smaller than this, however small the window gets.
-    pub const MIN_FONT_PX: f32 = 12.0;
+    pub min_font_px: f32,
     /// Wrap width as a fraction of canvas width.
-    pub const WRAP_WIDTH_FRACTION: f32 = 0.90;
+    pub wrap_width_fraction: f32,
     /// Distance from the bottom edge, as a fraction of canvas height.
-    pub const BOTTOM_MARGIN_FRACTION: f32 = 0.04;
-    /// Black outline width as a fraction of the font size.
-    pub const OUTLINE_FONT_FRACTION: f32 = 0.14;
-    /// House text: white, bold, on a rounded black outline.
-    pub const FONT_WEIGHT: f32 = 700.0;
-    /// Refuse to allocate a raster larger than this in either dimension.
-    pub const MAX_RASTER_PX: i32 = 8192;
+    pub bottom_margin_fraction: f32,
+    /// Stroked border behind the glyphs; `None` = no outline.
+    pub outline: Option<OutlineStyle>,
+    /// Box painted behind the whole cue; `None` = no box. When the subtitle
+    /// itself asks for a cue background (SSA `BorderStyle=3`, WebVTT
+    /// `::cue { background }`) that color wins, drawn with this box's
+    /// geometry (or square and snug when this is `None`).
+    pub background: Option<BackgroundStyle>,
+}
+
+/// A stroked border around the glyph edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutlineStyle {
+    pub color: Rgba,
+    /// Stroke width as a fraction of the font size.
+    pub width_fraction: f32,
+}
+
+/// The readability box behind the cue text.
+///
+/// Note this is a *tint*, not frosted glass: the raster is composited over
+/// the video later, so a true backdrop blur cannot happen here (the video
+/// pixels do not exist at raster time) — it belongs to the GPU compositor.
+/// `edge_softness` gives the CPU-side approximation: a gaussian-feathered
+/// rim instead of a hard edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BackgroundStyle {
+    pub color: Rgba,
+    /// Corner radius as a fraction of the font size (`0.0` = square).
+    pub corner_radius: f32,
+    /// Space between the text's ink and the box edge, as a fraction of the
+    /// font size.
+    pub padding: f32,
+    /// Gaussian feathering of the box edge, as a fraction of the font size
+    /// (`0.0` = hard edge).
+    pub edge_softness: f32,
+}
+
+impl Default for CueStyle {
+    /// The classic look, matching the pango renderer this module replaced:
+    /// bold white text on a rounded black outline, no box.
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_weight: 700.0,
+            font_height_fraction: 0.045,
+            min_font_px: 12.0,
+            wrap_width_fraction: 0.90,
+            bottom_margin_fraction: 0.04,
+            outline: Some(OutlineStyle {
+                color: [0, 0, 0, 217],
+                width_fraction: 0.14,
+            }),
+            background: None,
+        }
+    }
+}
+
+impl CueStyle {
+    /// The boxed-captions look: a slightly transparent black rounded box
+    /// behind the text for readability on busy video, no outline.
+    pub fn boxed() -> Self {
+        Self {
+            outline: None,
+            background: Some(BackgroundStyle {
+                color: [0, 0, 0, 160],
+                corner_radius: 0.35,
+                padding: 0.45,
+                edge_softness: 0.0,
+            }),
+            ..Self::default()
+        }
+    }
 }
 
 // -- cue content --------------------------------------------------------------
@@ -294,6 +383,7 @@ impl Raster {
 #[derive(Debug, Clone)]
 struct RasterKey {
     ir: Arc<CueIr>,
+    style: Arc<CueStyle>,
     canvas: (u32, u32),
     /// Number of reveal thresholds at or before the frame clock (0 = only
     /// the un-timed spans are visible). Always 0 for non-karaoke cues.
@@ -305,6 +395,7 @@ impl PartialEq for RasterKey {
         self.canvas == other.canvas
             && self.step == other.step
             && (Arc::ptr_eq(&self.ir, &other.ir) || self.ir == other.ir)
+            && (Arc::ptr_eq(&self.style, &other.style) || self.style == other.style)
     }
 }
 
@@ -336,6 +427,8 @@ struct State {
     active: Option<Active>,
     /// Display size the rasters are laid out against.
     canvas: (u32, u32),
+    /// The house style rasters are drawn with (see [`CueStyle`]).
+    style: Arc<CueStyle>,
     /// The video segment as captured by the sink, for pts → running time.
     video_segment: Option<gst::Segment>,
     /// Running time of the most recently shown frame. While paused this is
@@ -482,6 +575,38 @@ impl CueEngine {
     /// turned into the running time cues are scheduled in.
     pub fn set_video_segment(&self, segment: &gst::Segment) {
         self.shared.state.lock().video_segment = Some(segment.clone());
+    }
+
+    /// Change the house style (see [`CueStyle`]); the active cue re-rasters.
+    /// Callable at any time from any thread — a user toggling "subtitle
+    /// background" in a settings menu lands here, including while paused.
+    pub fn set_style(&self, style: CueStyle) {
+        let changed;
+        let fetch;
+        {
+            let mut state = self.shared.state.lock();
+            if *state.style == style {
+                return;
+            }
+            let style = Arc::new(style);
+            state.style = style.clone();
+
+            // The active cue's raster was drawn with the old style.
+            if let Some(active) = state.active.as_mut() {
+                active.key.style = style;
+                active.raster = RasterState::Pending;
+            }
+            let (want, filled) = self.resolve_raster(&mut state);
+            fetch = want;
+            changed = filled;
+        }
+
+        if let Some(request) = fetch {
+            self.request_raster(request);
+        }
+        if changed {
+            self.mark_changed();
+        }
     }
 
     /// FLUSH_STOP: both sides of the comparison are invalid — cues from
@@ -739,6 +864,7 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
                 state.active = Some(Active {
                     key: RasterKey {
                         ir: cue.content.ir.clone(),
+                        style: state.style.clone(),
                         canvas,
                         step: 0,
                     },
@@ -971,6 +1097,7 @@ impl RasterCtx {
     fn warm(&mut self) {
         let request = RasterKey {
             ir: Arc::new(CueIr::from_plain_text("Warming the font stack")),
+            style: Arc::new(CueStyle::default()),
             canvas: (640, 360),
             step: 0,
         };
@@ -981,18 +1108,19 @@ impl RasterCtx {
 
     fn render(&mut self, request: &RasterKey) -> Option<Raster> {
         let ir = &*request.ir;
+        let house = &*request.style;
         let (canvas_w, canvas_h) = request.canvas;
         if canvas_w == 0 || canvas_h == 0 {
             return None;
         }
         let (cw, ch) = (canvas_w as f32, canvas_h as f32);
 
-        let base_px = (ch * layout::FONT_HEIGHT_FRACTION).max(layout::MIN_FONT_PX);
+        let base_px = (ch * house.font_height_fraction).max(house.min_font_px);
         // Cue box width from the IR's `size` (WebVTT), else the house wrap.
         let size_pct = ir
             .layout
             .size
-            .unwrap_or(layout::WRAP_WIDTH_FRACTION * 100.0)
+            .unwrap_or(house.wrap_width_fraction * 100.0)
             .clamp(1.0, 100.0);
         let wrap_px = (cw * size_pct / 100.0).max(1.0);
 
@@ -1026,14 +1154,17 @@ impl RasterCtx {
         }
 
         let base = &ir.base;
-        let house_outline_px = (base_px * layout::OUTLINE_FONT_FRACTION).max(1.0);
+        let house_outline = house
+            .outline
+            .map(|o| (rgba(o.color), (base_px * o.width_fraction).max(1.0)))
+            .unwrap_or((Color::TRANSPARENT, 0.0));
         let base_brush = CueBrush {
             fg: base.foreground.map(color).unwrap_or(Color::WHITE),
             bg: base.background.map(color),
             outline: base
                 .outline
                 .map(|o| (color(o.color), pt_to_px(o.width).max(1.0)))
-                .unwrap_or((Color::from_rgba8(0, 0, 0, 217), house_outline_px)),
+                .unwrap_or(house_outline),
             shadow: base
                 .shadow
                 .map(|s| (color(s.color), pt_to_px(s.dx), pt_to_px(s.dy))),
@@ -1051,15 +1182,19 @@ impl RasterCtx {
             base_px,
             ch,
         )));
-        if let Some(family) = base.font_family.as_deref() {
-            b.push_default(FontFamilyName::Named(family.into()));
+        match (base.font_family.as_deref(), house.font_family.as_deref()) {
+            (Some(family), _) | (None, Some(family)) => {
+                b.push_default(FontFamilyName::Named(family.into()));
+            }
+            (None, None) => {}
         }
         if let Some(style) = base.font_style {
             b.push_default(font_style(style));
         }
-        // House style is bold; the IR (styles, <b>, CSS) overrides it.
+        // The house weight (bold by default); the IR (styles, <b>, CSS)
+        // overrides it.
         b.push_default(FontWeight::new(
-            base.font_weight.map_or(layout::FONT_WEIGHT, f32::from),
+            base.font_weight.map_or(house.font_weight, f32::from),
         ));
         if base.underline == Some(true) {
             b.push_default(StyleProperty::Underline(true));
@@ -1156,11 +1291,19 @@ impl RasterCtx {
                 }
             }
         }
-        let pad = reach.ceil() + 1.0;
+        // The box geometry (from the house style; the subtitle's own cue
+        // background reuses it, square and snug when there is none).
+        let box_pad = house.background.map_or(reach, |b| b.padding * base_px);
+        let box_radius = house.background.map_or(0.0, |b| b.corner_radius * base_px);
+        let box_soft = house.background.map_or(0.0, |b| b.edge_softness * base_px);
+        // Padding must cover whatever paints outside the ink: outline and
+        // shadow reach, the box padding, and the box's feathered rim
+        // (~3 standard deviations to fade out).
+        let pad = reach.max(box_pad + 3.0 * box_soft).ceil() + 1.0;
 
         let surface_w = ((ink_x1 - ink_x0).ceil() as i32) + 2 * pad as i32;
         let surface_h = (lh.ceil() as i32) + 2 * pad as i32;
-        if surface_w > layout::MAX_RASTER_PX || surface_h > layout::MAX_RASTER_PX {
+        if surface_w > MAX_RASTER_PX || surface_h > MAX_RASTER_PX {
             warn!(surface_w, surface_h, "cue raster too large, skipping");
             return None;
         }
@@ -1174,14 +1317,31 @@ impl RasterCtx {
         // Paint order, whole layout at a time so nothing overdraws a
         // neighbouring run: cue box, span boxes, shadows, outlines, fills
         // (with decorations).
-        if let Some(bg) = ir.layout.background.map(color) {
+        //
+        // The subtitle's own cue background (SSA BorderStyle=3, WebVTT
+        // ::cue { background }) wins over the house box color; the house
+        // geometry applies either way.
+        let box_color = ir
+            .layout
+            .background
+            .map(color)
+            .or_else(|| house.background.map(|b| rgba(b.color)));
+        if let Some(bg) = box_color {
             rc.set_paint(bg);
-            rc.fill_rect(&Rect::new(
-                (ink_x0 - pad) as f64,
-                -(pad as f64),
-                (ink_x1 + pad) as f64,
-                (lh + pad) as f64,
-            ));
+            let rect = Rect::new(
+                (ink_x0 - box_pad) as f64,
+                -(box_pad as f64),
+                (ink_x1 + box_pad) as f64,
+                (lh + box_pad) as f64,
+            );
+            if box_soft > 0.0 {
+                rc.fill_blurred_rounded_rect(&rect, box_radius, box_soft);
+            } else if box_radius > 0.0 {
+                use vello_cpu::kurbo::{RoundedRect, Shape};
+                rc.fill_path(&RoundedRect::from_rect(rect, box_radius as f64).to_path(0.1));
+            } else {
+                rc.fill_rect(&rect);
+            }
         }
         for line in playout.lines() {
             let m = line.metrics();
@@ -1257,7 +1417,7 @@ impl RasterCtx {
         rc.render_to_pixmap(&mut pixmap);
         let pixels = premul_to_straight_rgba(pixmap.data_as_u8_slice());
 
-        let (x, y) = place(ir, cw, ch, surface_w as f32, surface_h as f32, pad);
+        let (x, y) = place(ir, house, cw, ch, surface_w as f32, surface_h as f32, pad);
         Some(Raster {
             pixels,
             width: surface_w as u32,
@@ -1339,7 +1499,7 @@ fn draw_decoration(
 /// pins the anchor point exactly; otherwise WebVTT `position`/`line`
 /// percentages apply; otherwise the anchor's own frame region with the IR (or
 /// house) margins; the default is the customary bottom-center strip.
-fn place(ir: &CueIr, cw: f32, ch: f32, w: f32, h: f32, pad: f32) -> (i32, i32) {
+fn place(ir: &CueIr, house: &CueStyle, cw: f32, ch: f32, w: f32, h: f32, pad: f32) -> (i32, i32) {
     let anchor = ir.layout.anchor.unwrap_or(ir::Anchor::BottomCenter);
     let (col, row) = anchor_cell(anchor);
     // `pad` sits symmetrically around the ink, so anchoring the padded box
@@ -1364,7 +1524,7 @@ fn place(ir: &CueIr, cw: f32, ch: f32, w: f32, h: f32, pad: f32) -> (i32, i32) {
             .map(|m| m.vertical)
             .filter(|v| *v > 0.0)
             .map(|v| v / 100.0)
-            .unwrap_or(layout::BOTTOM_MARGIN_FRACTION)
+            .unwrap_or(house.bottom_margin_fraction)
             * ch;
         match anchor_row(anchor) {
             AnchorRow::Top => mv,
@@ -1414,6 +1574,10 @@ fn anchor_cell(a: ir::Anchor) -> (f32, f32) {
 
 fn color(c: ir::Color) -> Color {
     Color::from_rgba8(c.r, c.g, c.b, c.a)
+}
+
+fn rgba(c: Rgba) -> Color {
+    Color::from_rgba8(c[0], c[1], c[2], c[3])
 }
 
 fn pt_to_px(pt: f32) -> f32 {
@@ -1668,6 +1832,59 @@ mod tests {
         assert_eq!((after.width, after.height), (before.width, before.height));
         let painted = |o: &Overlay| o.pixels.chunks_exact(4).filter(|px| px[3] > 0).count();
         assert!(painted(&after) > painted(&before));
+    }
+
+    #[test]
+    fn boxed_style_draws_a_rounded_translucent_background() {
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.set_style(CueStyle::boxed());
+        engine.submit(cue("boxed", 0, 5_000));
+        engine.overlays_for(Some(ms(100)));
+
+        let overlay = ready_overlay(&engine);
+        let px = |x: u32, y: u32| -> [u8; 4] {
+            let at = ((y * overlay.width + x) * 4) as usize;
+            overlay.pixels[at..at + 4].try_into().unwrap()
+        };
+        // The very corner is outside the rounded rect: transparent.
+        assert_eq!(px(0, 0)[3], 0, "rounded corner must stay transparent");
+        // Just inside the left edge at mid-height (between the box edge and
+        // the text ink): the translucent black tint, not opaque, not clear.
+        let edge = px(4, overlay.height / 2);
+        assert!(
+            edge[3] > 100 && edge[3] < 220 && edge[0] < 30,
+            "expected the translucent black box inside the edge, got {edge:?}"
+        );
+        // The text itself still fills white somewhere.
+        assert!(
+            overlay
+                .pixels
+                .chunks_exact(4)
+                .any(|px| px[3] > 200 && px[0] > 200 && px[1] > 200 && px[2] > 200),
+            "expected white glyph fill inside the box"
+        );
+    }
+
+    #[test]
+    fn set_style_rerasters_the_active_cue() {
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(cue("styled live", 0, 10_000));
+        engine.overlays_for(Some(ms(100)));
+        let before = ready_overlay(&engine);
+
+        // The paused path: no frame flows, the style change alone repaints.
+        engine.set_style(CueStyle::boxed());
+        assert!(
+            wait_for(|| {
+                engine
+                    .current_overlays()
+                    .first()
+                    .is_some_and(|after| after.pixels != before.pixels)
+            }),
+            "a style change must re-raster the active cue"
+        );
     }
 
     #[test]
