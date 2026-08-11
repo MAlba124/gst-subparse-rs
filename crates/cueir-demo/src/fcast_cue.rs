@@ -124,23 +124,21 @@ mod layout {
 /// What a cue says and how it is styled. All three variants normalise to a
 /// [`CueIr`] at construction, so the engine and the worker only ever see the
 /// IR.
+///
+/// Identity is the IR itself, structurally: same IR ⇒ same pixels, which is
+/// what the raster cache keys on. (`CueIr` holds `f32`s and so has no lawful
+/// `Eq`/`Hash`; nothing here needs them — the cache is a bounded LRU `Vec`
+/// with a linear scan, so `PartialEq` is all a lookup takes.)
 #[derive(Debug, Clone)]
 pub struct CueContent {
     ir: Arc<CueIr>,
-    /// Deterministic identity for caching/equality: the IR's `Debug` form.
-    /// Two cues with the same fingerprint raster identically by construction.
-    fingerprint: Arc<str>,
 }
 
 impl CueContent {
     /// The styled IR straight off a buffer's `CueIrMeta`
     /// (`text-format=cue-ir`). This is the production path.
     pub fn ir(ir: CueIr) -> Self {
-        let fingerprint: Arc<str> = format!("{ir:?}").into();
-        Self {
-            ir: Arc::new(ir),
-            fingerprint,
-        }
+        Self { ir: Arc::new(ir) }
     }
 
     /// Pango-markup text (`rssubparse`/`rsssaparse` in their default mode).
@@ -164,13 +162,13 @@ impl CueContent {
 
 impl PartialEq for CueContent {
     fn eq(&self, other: &Self) -> bool {
-        self.fingerprint == other.fingerprint
+        // Pointer equality first: a re-shown cue is usually the same Arc.
+        Arc::ptr_eq(&self.ir, &other.ir) || self.ir == other.ir
     }
 }
-impl Eq for CueContent {}
 
 /// One cue, already converted to running time by the producer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CueInput {
     pub content: CueContent,
     pub start_rt: gst::ClockTime,
@@ -285,17 +283,29 @@ impl Raster {
     }
 }
 
-/// What a raster is fully determined by: the cue's content fingerprint, the
-/// canvas it is laid out against, and — for karaoke — how many reveal steps
-/// have passed. Same key ⇒ byte-identical pixels, which is what makes the
-/// cache sound.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// What a raster is fully determined by: the cue's IR, the canvas it is laid
+/// out against, and — for karaoke — how many reveal steps have passed. Same
+/// key ⇒ byte-identical pixels, which is what makes the cache sound.
+///
+/// Equality is structural over the IR (with an `Arc` pointer fast path via
+/// [`CueContent`]'s semantics); the cache is a linear-scan `Vec`, so no
+/// `Hash`/`Eq` is needed and `CueIr`'s floats never have to pretend they
+/// have either.
+#[derive(Debug, Clone)]
 struct RasterKey {
-    fingerprint: Arc<str>,
+    ir: Arc<CueIr>,
     canvas: (u32, u32),
     /// Number of reveal thresholds at or before the frame clock (0 = only
     /// the un-timed spans are visible). Always 0 for non-karaoke cues.
     step: usize,
+}
+
+impl PartialEq for RasterKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.canvas == other.canvas
+            && self.step == other.step
+            && (Arc::ptr_eq(&self.ir, &other.ir) || self.ir == other.ir)
+    }
 }
 
 #[derive(Debug)]
@@ -625,11 +635,11 @@ impl CueEngine {
         }
     }
 
-    /// Cache lookup for the active cue's raster. Returns the request to hand
-    /// to the worker (cache miss) and whether the active raster was filled
-    /// from cache. Must be called with `state` locked; takes the cache lock
+    /// Cache lookup for the active cue's raster. Returns the key to hand to
+    /// the worker (cache miss) and whether the active raster was filled from
+    /// cache. Must be called with `state` locked; takes the cache lock
     /// underneath it, which is the only order this pair is ever taken in.
-    fn resolve_raster(&self, state: &mut State) -> (Option<RasterRequest>, bool) {
+    fn resolve_raster(&self, state: &mut State) -> (Option<RasterKey>, bool) {
         let Some(active) = state.active.as_mut() else {
             return (None, false);
         };
@@ -640,14 +650,10 @@ impl CueEngine {
             active.raster = RasterState::Ready(raster);
             return (None, true);
         }
-        let request = RasterRequest {
-            key: active.key.clone(),
-            ir: active.cue.content.ir.clone(),
-        };
-        (Some(request), false)
+        (Some(active.key.clone()), false)
     }
 
-    fn request_raster(&self, request: RasterRequest) {
+    fn request_raster(&self, request: RasterKey) {
         let inbox = self.worker_inbox();
         let mut slot = inbox.slot.lock();
         // Latest-wins: an older outstanding request is for a cue that is no
@@ -732,7 +738,7 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
                 let steps = reveal_steps(&cue.content.ir, cue.start_rt, cue.pts_start);
                 state.active = Some(Active {
                     key: RasterKey {
-                        fingerprint: cue.content.fingerprint.clone(),
+                        ir: cue.content.ir.clone(),
                         canvas,
                         step: 0,
                     },
@@ -804,20 +810,13 @@ impl RasterCache {
 
 // -- the raster worker -----------------------------------------------------------
 
-/// Everything the worker needs to render one raster: the cache key it will be
-/// published under and the IR it depicts.
-#[derive(Debug, Clone)]
-struct RasterRequest {
-    key: RasterKey,
-    ir: Arc<CueIr>,
-}
-
 #[derive(Default)]
 struct Slot {
     /// Latest-wins: only the newest request matters, older ones are stale by
-    /// construction. The instant is when the request was made, so the worker
-    /// can report what the wait cost.
-    request: Option<(RasterRequest, Instant)>,
+    /// construction. The key carries everything the worker needs (the IR it
+    /// depicts, the canvas, the reveal step); the instant is when the request
+    /// was made, so the worker can report what the wait cost.
+    request: Option<(RasterKey, Instant)>,
     warm: bool,
     quit: bool,
 }
@@ -881,7 +880,7 @@ fn worker_main(shared: Weak<Shared>, inbox: Arc<Inbox>) {
         let ctx = ctx.get_or_insert_with(RasterCtx::new);
         let raster = ctx.render(&request).map(Arc::new);
         record_raster_latency(&shared, requested_at.elapsed());
-        if publish(&shared, request.key, raster) {
+        if publish(&shared, request, raster) {
             let engine = CueEngine { shared };
             engine.mark_changed();
         }
@@ -970,22 +969,19 @@ impl RasterCtx {
     /// Force the font stack to actually load: a throwaway cue, laid out and
     /// rasterized exactly like a real one.
     fn warm(&mut self) {
-        let request = RasterRequest {
-            key: RasterKey {
-                fingerprint: "warm".into(),
-                canvas: (640, 360),
-                step: 0,
-            },
+        let request = RasterKey {
             ir: Arc::new(CueIr::from_plain_text("Warming the font stack")),
+            canvas: (640, 360),
+            step: 0,
         };
         if self.render(&request).is_none() {
             warn!("cue raster warm-up produced no pixels");
         }
     }
 
-    fn render(&mut self, request: &RasterRequest) -> Option<Raster> {
+    fn render(&mut self, request: &RasterKey) -> Option<Raster> {
         let ir = &*request.ir;
-        let (canvas_w, canvas_h) = request.key.canvas;
+        let (canvas_w, canvas_h) = request.canvas;
         if canvas_w == 0 || canvas_h == 0 {
             return None;
         }
@@ -1074,7 +1070,7 @@ impl RasterCtx {
 
         for (range, span) in &spans {
             let s = &span.style;
-            let revealed = reveal_rank(&step_ns, span.reveal_ns) <= request.key.step;
+            let revealed = reveal_rank(&step_ns, span.reveal_ns) <= request.step;
             if !revealed
                 || s.foreground.is_some()
                 || s.background.is_some()
