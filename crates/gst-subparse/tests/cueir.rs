@@ -96,6 +96,35 @@ fn subparse_cue_ir_pushes_plain_text_with_meta() {
 }
 
 #[test]
+fn subparse_cue_ir_styles_srt_font_and_an_tags() {
+    // The C deletes <font> and shows {\an8} literally; cue-ir mode styles
+    // both. The default output below stays exactly the C's.
+    let srt = "1\n00:00:01,000 --> 00:00:02,000\n\
+               {\\an8}<font color=\"#00ff00\">green</font> plain\n\n";
+
+    let buffers = run_subparse(srt, None);
+    assert_eq!(
+        text_of(&buffers[0]),
+        "{\\an8}green plain",
+        "pango parity: font deleted, override block shown literally"
+    );
+
+    let buffers = run_subparse(srt, Some("cue-ir"));
+    assert_eq!(text_of(&buffers[0]), "green plain");
+    let meta = buffers[0].meta::<CueIrMeta>().expect("meta attached");
+    let ir = meta.ir();
+    assert_eq!(
+        ir.layout.anchor,
+        Some(subparse_formats::ir::Anchor::TopCenter)
+    );
+    let spans: Vec<_> = ir.lines.iter().flat_map(|l| l.spans.iter()).collect();
+    assert_eq!(spans[0].text, "green");
+    assert_eq!(spans[0].style.foreground, Some(Color::rgb(0, 255, 0)));
+    assert_eq!(spans[1].text, " plain");
+    assert!(spans[1].style.is_plain());
+}
+
+#[test]
 fn subparse_cue_ir_negotiates_utf8_caps() {
     init();
 

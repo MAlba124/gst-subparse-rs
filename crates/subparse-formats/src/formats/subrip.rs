@@ -146,6 +146,9 @@ impl Machine {
                 self.textbuf.push_str(line);
                 if line.is_empty() {
                     let text = markup_from_srt(&self.textbuf, &ALLOWED_TAGS);
+                    // The source text, kept for the cue-ir path: the pango
+                    // transform above is lossy (only <i>/<b>/<u> survive it).
+                    let raw = self.textbuf.trim_end_matches(['\n', '\r']).to_owned();
                     self.textbuf.clear();
                     // A reversed time line (end before start) passes the guard
                     // above and gives the C an underflowed, nonsensical
@@ -155,7 +158,9 @@ impl Machine {
                     // the element compares against (it does
                     // `start_time += duration` after every push).
                     let end = self.cur_end.max(self.cur_start);
-                    cues.push(Cue::new(self.cur_start, Some(end), text));
+                    let mut cue = Cue::new(self.cur_start, Some(end), text);
+                    cue.raw_text = Some(raw);
+                    cues.push(cue);
                     self.state = State::Id;
                 }
             }
@@ -634,6 +639,24 @@ mod tests {
     #[test]
     fn output_format_is_pango_markup() {
         assert_eq!(SubRip::default().output_format(), OutputFormat::PangoMarkup);
+    }
+
+    // ---- raw text side channel (cue-ir styling) --------------------------
+
+    #[test]
+    fn raw_text_carries_the_source_verbatim() {
+        // The pango transform deletes <font ...>; the raw side channel keeps
+        // the source so the cue-ir path can style it.
+        let cues = parse(
+            "1\n00:00:01,000 --> 00:00:02,000\n<font color=\"#ff0000\">Red</font> & <i>it</i>\nsecond line\n\n",
+        );
+        assert_eq!(cues.len(), 1);
+        // Parity text: font tag gone, & escaped, <i> kept.
+        assert_eq!(cues[0].text, "Red &amp; <i>it</i>\nsecond line");
+        assert_eq!(
+            cues[0].raw_text.as_deref(),
+            Some("<font color=\"#ff0000\">Red</font> & <i>it</i>\nsecond line")
+        );
     }
 
     // ---- timing --------------------------------------------------------

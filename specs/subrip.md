@@ -133,6 +133,28 @@ The last cue is emitted even without a trailing blank line (the element injects
 `"\n\n"` at EOS, and the parser appends one synthetic blank line to the same
 effect).
 
+## Styling (cue-ir only)
+
+The pipeline above is lossy: only `<i>/<b>/<u>` survive it, so `<font
+color="...">` — the one styling tag real SRT files actually use — is deleted
+from the pango output, and `{\an8}`-style override blocks (an SSA-ism every
+player honours) are shown literally. For `text-format=cue-ir` the parser
+keeps the cue's **source text** on `Cue.raw_text`, and
+`CueIr::from_srt_text` re-parses it into styled spans:
+
+- `<i>/<b>/<u>/<s>` and `<font color|face|size>` (attribute values quoted or
+  bare; colors named or `#hex`; sizes the legacy HTML `1..7` ladder, `+n/-n`
+  relative). Matching is lenient — case-insensitive names, unclosed tags
+  close at the cue's end, stray closers ignored.
+- Tag-vs-literal classification mirrors the C's visible-text behaviour:
+  unknown letter-initiated tags are dropped with their content kept;
+  `<3`, `< junk>` and other non-tags stay literal. Entities are **not**
+  decoded (this is source text, not markup), matching what the C's
+  escape-then-unescape round trip displays.
+- `{\anN}` / `{\aN}` blocks set the cue anchor (first wins); other `{\...}`
+  blocks are stripped from the IR text (the pango output keeps them
+  literally, like the C).
+
 ## Not handled here
 
 Charset detection, BOM stripping, and buffering/seeking live in the

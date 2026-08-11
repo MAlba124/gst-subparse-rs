@@ -581,6 +581,20 @@ impl CueIr {
     ) -> CueIr {
         markup::parse(markup, sheet, cue_id)
     }
+
+    /// Parse raw SubRip cue text ([`Cue::raw_text`], the source before the
+    /// C's lossy markup transform) into styled spans. Recognises
+    /// `<i>/<b>/<u>/<s>` and `<font color|face|size>` — leniently: names are
+    /// case-insensitive, unclosed tags close at the cue's end, stray closers
+    /// are ignored. Unknown letter-initiated tags are dropped with their
+    /// content kept (matching the C's text output); anything else (`<3`,
+    /// `< junk>`) stays literal, and entities are **not** decoded (this is
+    /// source text, not markup). `{\anN}`/`{\aN}` blocks — never part of
+    /// SubRip, but honoured by every player — set the cue anchor; other
+    /// `{\...}` blocks are stripped.
+    pub fn from_srt_text(text: &str) -> CueIr {
+        markup::parse_srt(text)
+    }
 }
 
 /// Build the IR for one parsed [`Cue`], honouring the flavour `output` says
@@ -590,10 +604,16 @@ impl CueIr {
 /// without one.
 pub fn cue_to_ir(cue: &Cue, output: OutputFormat, sheet: Option<&Stylesheet>) -> CueIr {
     let text = cue.text.trim_end_matches(['\n', '\r']);
-    let mut ir = match output {
-        OutputFormat::Utf8 => CueIr::from_plain_text(text),
-        OutputFormat::PangoMarkup => {
-            CueIr::from_pango_markup_styled(text, sheet, cue.id.as_deref())
+    let mut ir = if let Some(raw) = cue.raw_text.as_deref() {
+        // The source text carries styling the pango transform lost
+        // (SubRip's <font>).
+        CueIr::from_srt_text(raw.trim_end_matches(['\n', '\r']))
+    } else {
+        match output {
+            OutputFormat::Utf8 => CueIr::from_plain_text(text),
+            OutputFormat::PangoMarkup => {
+                CueIr::from_pango_markup_styled(text, sheet, cue.id.as_deref())
+            }
         }
     };
     apply_settings(&mut ir.layout, &cue.settings);
@@ -685,9 +705,31 @@ mod markup {
         sheet: Option<&'a Stylesheet>,
         /// Cue-wide style: `::cue` and `::cue(#id)` rules land here.
         base: SpanStyle,
+        /// Cue-level placement (raw-SRT `{\anN}` blocks land here).
+        layout: Layout,
+        /// `{\anN}`: the first one wins, like the SSA renderers.
+        an_set: bool,
     }
 
     pub(super) fn parse(input: &str, sheet: Option<&Stylesheet>, cue_id: Option<&str>) -> CueIr {
+        parse_impl(input, sheet, cue_id, false)
+    }
+
+    /// Raw SubRip cue text: same tag machinery, but the input is source text
+    /// rather than markup — no entity decoding, only letter-initiated `<...>`
+    /// regions are tags (the rest stays literal, mirroring how the C's
+    /// escape/unescape pipeline classifies them), and `{\...}` override
+    /// blocks are honoured for `\an` and otherwise stripped.
+    pub(super) fn parse_srt(input: &str) -> CueIr {
+        parse_impl(input, None, None, true)
+    }
+
+    fn parse_impl(
+        input: &str,
+        sheet: Option<&Stylesheet>,
+        cue_id: Option<&str>,
+        raw: bool,
+    ) -> CueIr {
         let sheet = sheet.filter(|s| !s.is_empty());
 
         // Rules matching the cue root apply to the whole cue: the argless
@@ -715,6 +757,8 @@ mod markup {
             rt_text: String::new(),
             sheet,
             base,
+            layout: Layout::default(),
+            an_set: false,
         };
 
         let bytes = input.as_bytes();
@@ -724,7 +768,13 @@ mod markup {
                 b'<' => match input[pos + 1..].find('>') {
                     Some(rel) => {
                         let tag = &input[pos + 1..pos + 1 + rel];
-                        p.handle_tag(tag);
+                        if raw && !is_srt_tag(tag) {
+                            // Not a tag by the C's reckoning (`<3`, `< x>`):
+                            // literal text, brackets and all.
+                            p.text(&input[pos..pos + rel + 2]);
+                        } else {
+                            p.handle_tag(tag);
+                        }
                         pos += rel + 2;
                     }
                     None => {
@@ -734,7 +784,7 @@ mod markup {
                         break;
                     }
                 },
-                b'&' => {
+                b'&' if !raw => {
                     let (ch, used) = decode_entity(&input[pos..]);
                     match ch {
                         Some(c) => p.push_char(c),
@@ -742,13 +792,39 @@ mod markup {
                     }
                     pos += used;
                 }
+                b'{' if raw => {
+                    if bytes.get(pos + 1) != Some(&b'\\') {
+                        // A plain brace is ordinary text. (This arm must
+                        // consume it: the text arm below stops at '{'.)
+                        p.push_char('{');
+                        pos += 1;
+                    } else {
+                        match input[pos + 1..].find('}') {
+                            Some(rel) => {
+                                p.ssa_block(&input[pos + 1..pos + 1 + rel]);
+                                pos += rel + 2;
+                            }
+                            None => {
+                                // Unclosed block: literal, like the ssaparse
+                                // text path keeps an unmatched '{'.
+                                p.text(&input[pos..]);
+                                break;
+                            }
+                        }
+                    }
+                }
                 b'\n' => {
                     p.end_line();
                     pos += 1;
                 }
                 _ => {
+                    let stops: &[char] = if raw {
+                        &['<', '{', '\n']
+                    } else {
+                        &['<', '&', '\n']
+                    };
                     let end = input[pos..]
-                        .find(['<', '&', '\n'])
+                        .find(stops)
                         .map(|rel| pos + rel)
                         .unwrap_or(input.len());
                     p.text(&input[pos..end]);
@@ -757,6 +833,20 @@ mod markup {
             }
         }
         p.finish()
+    }
+
+    /// Whether a raw `<...>` body is a tag: whitelisted names may follow
+    /// leading spaces (the C's unescape step skips them), anything else needs
+    /// a letter right after the optional `/` (the C's unhandled-tag removal
+    /// check). Everything else — `<3`, `< junk>`, inline timestamps — stays
+    /// literal text.
+    fn is_srt_tag(tag: &str) -> bool {
+        let body = tag.strip_prefix('/').unwrap_or(tag);
+        if body.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            return true;
+        }
+        let name = tag_name(body.trim_start_matches([' ', '\t']));
+        matches!(name.as_str(), "i" | "b" | "u" | "s" | "font")
     }
 
     /// Decode one `&...;` reference starting at `input` (which begins with
@@ -852,9 +942,35 @@ mod markup {
                 self.lines.push(Line { spans });
             }
             CueIr {
+                layout: self.layout,
                 lines: self.lines,
                 base: self.base,
-                ..CueIr::default()
+            }
+        }
+
+        /// A `{\...}` override block inside raw SRT text. Never part of the
+        /// format, but every player honours them, so `\anN` (numpad) and
+        /// `\aN` (legacy) set the cue anchor — first one wins, like the SSA
+        /// renderers — and everything else is stripped.
+        fn ssa_block(&mut self, block: &str) {
+            for seg in block.split('\\').skip(1) {
+                let seg = seg.trim();
+                let numpad = if let Some(n) = seg.strip_prefix("an") {
+                    n.parse::<i32>().ok()
+                } else if let Some(n) = seg.strip_prefix('a') {
+                    n.parse::<i32>()
+                        .ok()
+                        .and_then(crate::ssastyle::legacy_to_numpad)
+                } else {
+                    None
+                };
+                if !self.an_set
+                    && let Some((anchor, align)) = numpad.and_then(crate::ssastyle::numpad_anchor)
+                {
+                    self.layout.anchor = Some(anchor);
+                    self.layout.align = Some(align);
+                    self.an_set = true;
+                }
             }
         }
 
@@ -902,6 +1018,7 @@ mod markup {
                 "sub" => self.ctx.style.baseline_shift = Some(-3.0),
                 "sup" => self.ctx.style.baseline_shift = Some(3.0),
                 "span" => self.apply_span_attrs(rest),
+                "font" => self.apply_font_attrs(rest),
                 "v" => {
                     // WebVTT voice: the annotation is the speaker, e.g.
                     // `<v Fred>`.
@@ -1091,6 +1208,40 @@ mod markup {
                 }
             }
         }
+
+        /// `<font color=... face=... size=...>`: the HTML-ish tag SubRip
+        /// files use (the C deletes it; the raw-SRT cue-ir path keeps it).
+        /// Values may be quoted or bare; colors are pango-style (named or
+        /// `#hex`), sizes the legacy HTML `1..7` ladder.
+        fn apply_font_attrs(&mut self, attrs: &str) {
+            for (key, value) in AttrIter::new(attrs) {
+                let style = &mut self.ctx.style;
+                match key.to_ascii_lowercase().as_str() {
+                    "color" => {
+                        if let Some(c) = Color::parse(&value) {
+                            style.foreground = Some(c);
+                        }
+                    }
+                    "face" => style.font_family = Some(value),
+                    "size" => {
+                        if let Some(s) = html_font_size(&value) {
+                            style.font_size = Some(s);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The legacy HTML `<font size>`: absolute `1..7` (3 = medium) or
+    /// `+n`/`-n` relative to 3, mapped onto the same 1.2-step ladder the
+    /// keyword sizes use.
+    fn html_font_size(value: &str) -> Option<FontSize> {
+        let v = value.trim();
+        let n = v.parse::<i32>().ok()?;
+        let abs = if v.starts_with(['+', '-']) { 3 + n } else { n };
+        Some(FontSize::Scale(1.2f32.powi(abs.clamp(1, 7) - 3)))
     }
 
     /// Split a WebVTT tag's post-name text into its `.class` list and its
@@ -1208,10 +1359,15 @@ mod markup {
                 let after = s[eq + 1..].trim_start();
                 let quote = after.chars().next()?;
                 if quote != '"' && quote != '\'' {
-                    // Malformed (unquoted) value: skip this token and go on.
-                    let skip = after.find(char::is_whitespace).unwrap_or(after.len());
-                    self.rest = &after[skip..];
-                    continue;
+                    // Unquoted value (common in the wild: `color=red`): runs
+                    // to the next whitespace.
+                    let end = after.find(char::is_whitespace).unwrap_or(after.len());
+                    let value = &after[..end];
+                    self.rest = &after[end..];
+                    if key.is_empty() || value.is_empty() {
+                        continue;
+                    }
+                    return Some((key.to_owned(), value.to_owned()));
                 }
                 let close = after[1..].find(quote)?;
                 let value = &after[1..1 + close];
@@ -1484,6 +1640,104 @@ mod tests {
         );
     }
 
+    // ---- raw subrip text (Cue::raw_text) -----------------------------------------
+
+    #[test]
+    fn srt_font_color_tags() {
+        let ir = CueIr::from_srt_text(
+            "<font color=\"#ff0000\">red</font> and <font color=lime>green</font>",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.foreground, Some(Color::rgb(255, 0, 0)));
+        assert_eq!(spans[1].text, " and ");
+        assert!(spans[1].style.is_plain());
+        assert_eq!(spans[2].style.foreground, Some(Color::rgb(0, 255, 0)));
+        assert_eq!(ir.plain_text(), "red and green");
+    }
+
+    #[test]
+    fn srt_font_face_and_size() {
+        let ir = CueIr::from_srt_text("<font face=\"Comic Sans\" size=\"5\">x</font>");
+        let s = &spans_of(&ir)[0].style;
+        assert_eq!(s.font_family.as_deref(), Some("Comic Sans"));
+        assert_eq!(s.font_size, Some(FontSize::Scale(1.2f32.powi(2))));
+        // Relative size, unquoted.
+        let ir = CueIr::from_srt_text("<font size=+1>x</font>");
+        assert_eq!(spans_of(&ir)[0].style.font_size, Some(FontSize::Scale(1.2)));
+    }
+
+    #[test]
+    fn srt_simple_tags_and_case_insensitivity() {
+        let ir = CueIr::from_srt_text("<I>it</I><B>bo</B><u>un</u>");
+        let spans = spans_of(&ir);
+        assert_eq!(spans[0].style.font_style, Some(FontStyle::Italic));
+        assert_eq!(spans[1].style.font_weight, Some(700));
+        assert_eq!(spans[2].style.underline, Some(true));
+    }
+
+    #[test]
+    fn srt_unclosed_font_closes_at_end() {
+        let ir = CueIr::from_srt_text("<font color=\"cyan\">all of it");
+        assert_eq!(
+            spans_of(&ir)[0].style.foreground,
+            Some(Color::rgb(0, 255, 255))
+        );
+    }
+
+    #[test]
+    fn srt_raw_text_is_not_markup() {
+        // No entity decoding, literal '<' runs stay literal.
+        let ir = CueIr::from_srt_text("5 &lt; 6 & <3 love");
+        assert_eq!(ir.plain_text(), "5 &lt; 6 & <3 love");
+        // `<3>` has a '>' but is not letter-initiated: literal.
+        assert_eq!(CueIr::from_srt_text("a <3> b").plain_text(), "a <3> b");
+        // `< junk>` (leading space, not whitelisted): literal, like the C.
+        assert_eq!(CueIr::from_srt_text("a < x> b").plain_text(), "a < x> b");
+        // `< i>` is whitelisted despite the space (the C unescapes it too).
+        let ir = CueIr::from_srt_text("< i>x</i>");
+        assert_eq!(spans_of(&ir)[0].style.font_style, Some(FontStyle::Italic));
+    }
+
+    #[test]
+    fn srt_unknown_letter_tags_drop_keeping_content() {
+        // What the C's remove_unhandled_tags does to the visible text.
+        assert_eq!(
+            CueIr::from_srt_text("a <blink>b</blink> c").plain_text(),
+            "a b c"
+        );
+    }
+
+    #[test]
+    fn srt_an_blocks_set_the_anchor() {
+        let ir = CueIr::from_srt_text("{\\an8}on top");
+        assert_eq!(ir.layout.anchor, Some(Anchor::TopCenter));
+        assert_eq!(ir.layout.align, Some(TextAlign::Center));
+        assert_eq!(ir.plain_text(), "on top");
+        // Legacy \a form; first block wins.
+        let ir = CueIr::from_srt_text("{\\a6}{\\an1}x");
+        assert_eq!(ir.layout.anchor, Some(Anchor::TopCenter));
+        // Other override blocks are stripped, plain braces stay.
+        assert_eq!(
+            CueIr::from_srt_text("{\\pos(1,2)}a {not a tag} b").plain_text(),
+            "a {not a tag} b"
+        );
+        // Unclosed block stays literal.
+        assert_eq!(CueIr::from_srt_text("a {\\an8").plain_text(), "a {\\an8");
+    }
+
+    #[test]
+    fn cue_to_ir_prefers_raw_text() {
+        // The parity text lost the font tag; the raw text keeps it.
+        let mut cue = Cue::new(0, Some(1), "colored");
+        cue.raw_text = Some("<font color=\"red\">colored</font>".to_owned());
+        let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
+        assert_eq!(
+            spans_of(&ir)[0].style.foreground,
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(ir.plain_text(), "colored");
+    }
+
     // ---- webvtt stylesheets (STYLE blocks) --------------------------------------
 
     fn styled(markup: &str, css: &str) -> CueIr {
@@ -1629,20 +1883,14 @@ mod tests {
 
     #[test]
     fn cue_settings_fold_into_layout() {
-        let cue = Cue {
-            start_ns: 0,
-            end_ns: Some(1),
-            text: "x".to_owned(),
-            settings: CueSettings {
-                line_position: Some(10),
-                text_position: Some(50),
-                text_size: Some(35),
-                vertical: Some("vertical-lr".to_owned()),
-                alignment: Some("middle".to_owned()),
-                ..CueSettings::default()
-            },
-            id: None,
-            ssa: None,
+        let mut cue = Cue::new(0, Some(1), "x");
+        cue.settings = CueSettings {
+            line_position: Some(10),
+            text_position: Some(50),
+            text_size: Some(35),
+            vertical: Some("vertical-lr".to_owned()),
+            alignment: Some("middle".to_owned()),
+            ..CueSettings::default()
         };
         let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
         assert_eq!(ir.layout.line, Some(LinePosition::Percent(10.0)));
@@ -1654,21 +1902,15 @@ mod tests {
 
     #[test]
     fn modern_cue_settings_fold_into_layout() {
-        let cue = Cue {
-            start_ns: 0,
-            end_ns: Some(1),
-            text: "x".to_owned(),
-            settings: CueSettings {
-                line_number: Some(-1),
-                line_align: Some("end".to_owned()),
-                text_position: Some(50),
-                position_align: Some("line-left".to_owned()),
-                vertical: Some("rl".to_owned()),
-                alignment: Some("center".to_owned()),
-                ..CueSettings::default()
-            },
-            id: None,
-            ssa: None,
+        let mut cue = Cue::new(0, Some(1), "x");
+        cue.settings = CueSettings {
+            line_number: Some(-1),
+            line_align: Some("end".to_owned()),
+            text_position: Some(50),
+            position_align: Some("line-left".to_owned()),
+            vertical: Some("rl".to_owned()),
+            alignment: Some("center".to_owned()),
+            ..CueSettings::default()
         };
         let ir = cue_to_ir(&cue, OutputFormat::PangoMarkup, None);
         assert_eq!(ir.layout.line, Some(LinePosition::Line(-1)));

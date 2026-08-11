@@ -40,7 +40,11 @@ strips: colors, fonts, bold/italic/underline/strikeout, outline and shadow,
 `\an`/`\pos` placement, margins, karaoke timing as per-span reveal times —
 see `subparse_formats::ssastyle`.
 
-The default pango-markup output stays byte-identical to the C either way.
+For SubRip, cue-ir mode keeps the `<font color|face|size>` tags the C
+deletes and honours `{\an8}`-style positioning blocks (shown literally by
+the C) as the cue anchor.
+
+The default pango-markup output stays byte-identical to the C in every case.
 
 [crates/cueir-demo](crates/cueir-demo/) is a runnable end-to-end demo of
 exactly that (a standalone crate, not a workspace member): it pipes a subtitle

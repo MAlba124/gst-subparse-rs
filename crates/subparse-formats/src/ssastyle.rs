@@ -396,8 +396,9 @@ fn parse_bold(s: &str) -> Option<u16> {
 }
 
 /// Numpad alignment (ASS `\an`, v4+ `Alignment`) to the IR anchor + the text
-/// alignment it implies.
-fn numpad_anchor(n: i32) -> Option<(Anchor, TextAlign)> {
+/// alignment it implies. Also used by the raw-SRT path in [`crate::ir`]
+/// (`{\anN}` blocks in SubRip text).
+pub(crate) fn numpad_anchor(n: i32) -> Option<(Anchor, TextAlign)> {
     Some(match n {
         1 => (Anchor::BottomLeft, TextAlign::Left),
         2 => (Anchor::BottomCenter, TextAlign::Center),
@@ -414,7 +415,7 @@ fn numpad_anchor(n: i32) -> Option<(Anchor, TextAlign)> {
 
 /// Legacy alignment (SSA v4 `Alignment`, `\a`) to numpad: 1-3 bottom,
 /// +4 = top ("toptitle"), +8 = middle ("midtitle").
-fn legacy_to_numpad(a: i32) -> Option<i32> {
+pub(crate) fn legacy_to_numpad(a: i32) -> Option<i32> {
     Some(match a {
         1..=3 => a,
         5..=7 => a + 2,

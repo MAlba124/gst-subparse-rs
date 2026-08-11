@@ -61,6 +61,12 @@ pub struct Cue {
     /// name, margin overrides). Only consumed by the `cue-ir` output path;
     /// the pango-markup output ignores it, like the C element.
     pub ssa: Option<Box<crate::ssastyle::SsaDialogue>>,
+    /// The cue's source text before the markup pipeline, for formats whose
+    /// pango transform is lossy (SubRip: the C whitelist keeps only
+    /// `<i>/<b>/<u>` and deletes e.g. `<font color>`). Only consumed by the
+    /// `cue-ir` output path ([`crate::ir::CueIr::from_srt_text`]); the
+    /// pango-markup output ignores it, like the C element.
+    pub raw_text: Option<String>,
 }
 
 impl Cue {
@@ -73,6 +79,7 @@ impl Cue {
             settings: CueSettings::default(),
             id: None,
             ssa: None,
+            raw_text: None,
         }
     }
 

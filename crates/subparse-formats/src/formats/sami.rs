@@ -25,7 +25,7 @@
 //! re-escaped so they survive as markup, HTML/numeric entities become UTF-8, and
 //! a bare `&` becomes `&amp;`.
 
-use crate::cue::{Cue, CueSettings, OutputFormat, ParseContext, ParseError};
+use crate::cue::{Cue, OutputFormat, ParseContext, ParseError};
 use crate::format::{LineScanner, Parsed, SubtitleFormat};
 
 /// Nanoseconds per millisecond (SAMI `Start=` attributes are milliseconds).
@@ -140,14 +140,7 @@ impl SamiContext {
                 Some(self.time2)
             };
             self.has_result = false;
-            return Some(Cue {
-                start_ns,
-                end_ns,
-                text,
-                settings: CueSettings::default(),
-                id: None,
-                ssa: None,
-            });
+            return Some(Cue::new(start_ns, end_ns, text));
         }
         None
     }
