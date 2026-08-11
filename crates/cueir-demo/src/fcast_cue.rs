@@ -357,7 +357,11 @@ fn reveal_rank(ir_steps: &[u64], reveal_ns: Option<u64>) -> usize {
 /// alpha, placed in window coordinates.
 #[derive(Debug)]
 pub struct Raster {
-    pixels: Vec<u8>,
+    /// Shared with every [`Overlay`] built from this raster: a cue strip is
+    /// megabytes, and `overlays_for` runs per displayed frame — cloning the
+    /// bytes there (as the pango version did) was the module's only heavy
+    /// per-frame cost.
+    pixels: Arc<Vec<u8>>,
     width: u32,
     height: u32,
     x: i32,
@@ -365,8 +369,8 @@ pub struct Raster {
 }
 
 impl Raster {
-    /// Copies the pixels, since [`Overlay`] owns them. One memcpy per frame
-    /// while a cue is on screen — same order as the composition-meta path.
+    /// Cheap: the pixel buffer is refcount-shared with the overlay, so this
+    /// is a handful of scalar copies per frame, not a memcpy.
     fn to_overlay(&self) -> Overlay {
         Overlay {
             pixels: self.pixels.clone(),
@@ -588,6 +592,11 @@ impl CueEngine {
                 active.key.canvas = (width, height);
                 active.raster = RasterState::Pending;
             }
+            // Old-canvas rasters can never match again; drop them now.
+            self.shared
+                .cache
+                .lock()
+                .prune(|key| key.canvas == (width, height));
             let (want, filled) = self.resolve_raster(&mut state);
             fetch = want;
             changed = filled;
@@ -635,6 +644,7 @@ impl CueEngine {
                 active.key.video_rect = rect;
                 active.raster = RasterState::Pending;
             }
+            self.shared.cache.lock().prune(|key| key.video_rect == rect);
             let (want, filled) = self.resolve_raster(&mut state);
             fetch = want;
             changed = filled;
@@ -664,9 +674,13 @@ impl CueEngine {
 
             // The active cue's raster was drawn with the old style.
             if let Some(active) = state.active.as_mut() {
-                active.key.style = style;
+                active.key.style = style.clone();
                 active.raster = RasterState::Pending;
             }
+            self.shared
+                .cache
+                .lock()
+                .prune(|key| Arc::ptr_eq(&key.style, &style) || *key.style == *style);
             let (want, filled) = self.resolve_raster(&mut state);
             fetch = want;
             changed = filled;
@@ -832,21 +846,41 @@ impl CueEngine {
     }
 
     /// Cache lookup for the active cue's raster. Returns the key to hand to
-    /// the worker (cache miss) and whether the active raster was filled from
-    /// cache. Must be called with `state` locked; takes the cache lock
-    /// underneath it, which is the only order this pair is ever taken in.
+    /// the worker (a miss, or a karaoke prefetch) and whether the active
+    /// raster was filled from cache. Must be called with `state` locked;
+    /// takes the cache lock underneath it, which is the only order this pair
+    /// is ever taken in.
     fn resolve_raster(&self, state: &mut State) -> (Option<RasterKey>, bool) {
         let Some(active) = state.active.as_mut() else {
             return (None, false);
         };
-        if !matches!(active.raster, RasterState::Pending) {
-            return (None, false);
+        match active.raster {
+            RasterState::Pending => {
+                if let Some(raster) = self.shared.cache.lock().get(&active.key) {
+                    active.raster = RasterState::Ready(raster);
+                    (None, true)
+                } else {
+                    (Some(active.key.clone()), false)
+                }
+            }
+            // Karaoke: while the current step shows, warm the next one so
+            // crossing a reveal threshold is a cache hit instead of a raster
+            // latency. `publish` files a prefetch under its own key without
+            // touching what is on screen. (Once cached, this is one short
+            // cache probe per frame, only for karaoke cues.)
+            RasterState::Ready(_) if active.key.step < active.steps.len() => {
+                let next = RasterKey {
+                    step: active.key.step + 1,
+                    ..active.key.clone()
+                };
+                if self.shared.cache.lock().get(&next).is_none() {
+                    (Some(next), false)
+                } else {
+                    (None, false)
+                }
+            }
+            _ => (None, false),
         }
-        if let Some(raster) = self.shared.cache.lock().get(&active.key) {
-            active.raster = RasterState::Ready(raster);
-            return (None, true);
-        }
-        (Some(active.key.clone()), false)
     }
 
     fn request_raster(&self, request: RasterKey) {
@@ -1002,6 +1036,14 @@ impl RasterCache {
         }
     }
 
+    /// Drop every entry whose key fails `keep`. Called when the canvas,
+    /// style or video rect changes: entries keyed on the old value can never
+    /// match again, and at megabytes per raster they should not sit in
+    /// memory until sixteen new inserts push them out.
+    fn prune(&mut self, keep: impl Fn(&RasterKey) -> bool) {
+        self.entries.retain(|(key, _)| keep(key));
+    }
+
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1075,6 +1117,21 @@ fn worker_main(shared: Weak<Shared>, inbox: Arc<Inbox>) {
         let Some(shared) = shared.upgrade() else {
             break;
         };
+
+        // The engine re-requests a Pending key every frame while a raster is
+        // in flight, so after publishing, the slot often holds a stale copy
+        // of the request just completed. Serve it from the cache instead of
+        // rendering the same pixels twice (which used to halve worker
+        // throughput exactly when rasters were slowest). Cache hits are not
+        // recorded in the latency window: it measures the rasterizer.
+        let cached = shared.cache.lock().get(&request);
+        if let Some(raster) = cached {
+            if publish(&shared, request, Some(raster)) {
+                let engine = CueEngine { shared };
+                engine.mark_changed();
+            }
+            continue;
+        }
 
         let ctx = ctx.get_or_insert_with(RasterCtx::new);
         let raster = ctx.render(&request).map(Arc::new);
@@ -1155,6 +1212,11 @@ impl Default for CueBrush {
 struct RasterCtx {
     font_cx: FontContext,
     layout_cx: LayoutContext<CueBrush>,
+    /// The render surface, reused across rasters of the same size (karaoke
+    /// steps in particular): keeps vello's glyph outline/hinting cache warm
+    /// (`reset()` retains it) and avoids two large allocations per raster.
+    /// `render_to_pixmap` clears before writing, so reuse is safe.
+    surface: Option<((u16, u16), RenderContext, Pixmap)>,
 }
 
 impl RasterCtx {
@@ -1162,7 +1224,22 @@ impl RasterCtx {
         Self {
             font_cx: FontContext::new(),
             layout_cx: LayoutContext::new(),
+            surface: None,
         }
+    }
+
+    /// The reusable `(RenderContext, Pixmap)` for a `dims`-sized raster.
+    fn surface(&mut self, dims: (u16, u16)) -> (&mut RenderContext, &mut Pixmap) {
+        let reusable = matches!(&self.surface, Some((have, _, _)) if *have == dims);
+        if !reusable {
+            let (w, h) = dims;
+            self.surface = Some((dims, RenderContext::new(w, h), Pixmap::new(w, h)));
+        }
+        let (_, rc, pixmap) = self.surface.as_mut().expect("just ensured");
+        if reusable {
+            rc.reset();
+        }
+        (rc, pixmap)
     }
 
     /// Force the font stack to actually load: a throwaway cue, laid out and
@@ -1401,7 +1478,7 @@ impl RasterCtx {
             return None;
         }
 
-        let mut rc = RenderContext::new(surface_w as u16, surface_h as u16);
+        let (mut rc, pixmap) = self.surface((surface_w as u16, surface_h as u16));
         rc.set_transform(Affine::translate(Vec2::new(
             (pad - ink_x0) as f64,
             pad as f64,
@@ -1464,12 +1541,7 @@ impl RasterCtx {
         for_each_revealed_run(&playout, |glyph_run| {
             if let Some((shadow, dx, dy)) = glyph_run.style().brush.shadow {
                 rc.set_paint(shadow);
-                draw_glyphs(
-                    &mut rc,
-                    glyph_run,
-                    Pass::Fill,
-                    Vec2::new(dx as f64, dy as f64),
-                );
+                draw_glyphs(rc, glyph_run, Pass::Fill, Vec2::new(dx as f64, dy as f64));
             }
         });
         for_each_revealed_run(&playout, |glyph_run| {
@@ -1481,34 +1553,33 @@ impl RasterCtx {
                         .with_join(Join::Round)
                         .with_caps(Cap::Round),
                 );
-                draw_glyphs(&mut rc, glyph_run, Pass::Stroke, Vec2::ZERO);
+                draw_glyphs(rc, glyph_run, Pass::Stroke, Vec2::ZERO);
             }
         });
         for_each_revealed_run(&playout, |glyph_run| {
             let brush = glyph_run.style().brush.clone();
             rc.set_paint(brush.fg);
-            draw_glyphs(&mut rc, glyph_run, Pass::Fill, Vec2::ZERO);
+            draw_glyphs(rc, glyph_run, Pass::Fill, Vec2::ZERO);
 
             let run = glyph_run.run();
             let style = glyph_run.style();
             if let Some(decoration) = &style.underline {
                 let offset = decoration.offset.unwrap_or(run.metrics().underline_offset);
                 let size = decoration.size.unwrap_or(run.metrics().underline_size);
-                draw_decoration(&mut rc, glyph_run, brush.fg, offset, size);
+                draw_decoration(rc, glyph_run, brush.fg, offset, size);
             }
             if let Some(decoration) = &style.strikethrough {
                 let offset = decoration
                     .offset
                     .unwrap_or(run.metrics().strikethrough_offset);
                 let size = decoration.size.unwrap_or(run.metrics().strikethrough_size);
-                draw_decoration(&mut rc, glyph_run, brush.fg, offset, size);
+                draw_decoration(rc, glyph_run, brush.fg, offset, size);
             }
         });
 
         rc.flush();
-        let mut pixmap = Pixmap::new(surface_w as u16, surface_h as u16);
-        rc.render_to_pixmap(&mut pixmap);
-        let pixels = premul_to_straight_rgba(pixmap.data_as_u8_slice());
+        rc.render_to_pixmap(pixmap);
+        let pixels = Arc::new(premul_to_straight_rgba(pixmap.data_as_u8_slice()));
 
         let (x, y) = place(
             ir,
@@ -1754,36 +1825,60 @@ fn alignment(align: Option<ir::TextAlign>) -> Alignment {
     }
 }
 
+/// `⌈255/a⌉` in 16.16 fixed point, per alpha value: `(v * RECIP[a]) >> 16`
+/// rounds to within 1 LSB of `v * 255 / a` without a per-pixel division.
+static UNPREMUL_RECIP: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut a = 1usize;
+    while a < 256 {
+        table[a] = ((255u32 << 16) + (a as u32) / 2) / (a as u32);
+        a += 1;
+    }
+    table
+};
+
 /// vello_cpu's pixmap is premultiplied RGBA; overlays are tightly packed
 /// straight-alpha RGBA (`Overlay::pixels`, uploaded as `PL_ALPHA_INDEPENDENT`).
+///
+/// This runs over every pixel of every raster (~20% of a raster's cost
+/// before it was tuned), so the two dominant alpha populations are
+/// fast-pathed — fully transparent padding and fully opaque glyph
+/// interiors — and the remainder uses the reciprocal table instead of three
+/// integer divisions per pixel.
 fn premul_to_straight_rgba(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for px in data.as_chunks::<4>().0 {
         let alpha = px[3];
-        if alpha == 0 {
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            continue;
+        match alpha {
+            0 => out.extend_from_slice(&[0, 0, 0, 0]),
+            255 => out.extend_from_slice(px),
+            _ => {
+                let recip = UNPREMUL_RECIP[alpha as usize];
+                let unpremultiply =
+                    |value: u8| -> u8 { ((value as u32 * recip + (1 << 15)) >> 16).min(255) as u8 };
+                out.push(unpremultiply(px[0]));
+                out.push(unpremultiply(px[1]));
+                out.push(unpremultiply(px[2]));
+                out.push(alpha);
+            }
         }
-        let unpremultiply = |value: u8| -> u8 {
-            let scaled = (value as u32 * 255 + alpha as u32 / 2) / alpha as u32;
-            scaled.min(255) as u8
-        };
-        out.push(unpremultiply(px[0]));
-        out.push(unpremultiply(px[1]));
-        out.push(unpremultiply(px[2]));
-        out.push(alpha);
     }
     out
 }
 
 // -- PORT SHIM ---------------------------------------------------------------------
 // fcast: delete this section and `use crate::video::{Overlay, OverlaySpace};`
-// instead. The fields match `fcast-video/src/video.rs` one-for-one.
+// instead. The fields match `fcast-video/src/video.rs` one-for-one, EXCEPT
+// `pixels`, which is `Arc<Vec<u8>>` here rather than `Vec<u8>`: a cue strip
+// is megabytes and an Overlay is built per displayed frame, so the buffer is
+// refcount-shared with the raster instead of memcpy'd. Make the same change
+// in fcast's `Overlay` — its upload path only reads `&pixels[..]`, which
+// derefs identically.
 
 /// A composited overlay for one frame (mirror of `crate::video::Overlay`).
 #[derive(Debug, Clone)]
 pub struct Overlay {
-    pub pixels: Vec<u8>,
+    pub pixels: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub x: i32,
@@ -2115,6 +2210,87 @@ mod tests {
             "cache hit is instant"
         );
         assert_eq!(engine.raster_latencies().len(), latencies);
+    }
+
+    #[test]
+    fn karaoke_next_step_is_prefetched() {
+        let mut ir = CueIr::from_plain_text("la la");
+        ir.lines[0].spans[0].text = "la ".into();
+        let mut second = ir.lines[0].spans[0].clone();
+        second.text = "la".into();
+        second.reveal_ns = Some(ms(500).nseconds());
+        ir.lines[0].spans.push(second);
+
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            start_rt: ms(0),
+            end_rt: Some(ms(2_000)),
+            pts_start: Some(gst::ClockTime::ZERO),
+        });
+        engine.overlays_for(Some(ms(100)));
+        ready_overlay(&engine);
+
+        // While step 0 shows, frames keep flowing and the next step lands in
+        // the cache speculatively.
+        assert!(
+            wait_for(|| {
+                engine.overlays_for(Some(ms(150)));
+                engine.cached_rasters() >= 2
+            }),
+            "step 1 must be prefetched while step 0 is on screen"
+        );
+        let worker_renders = engine.raster_latencies().len();
+
+        // Crossing the reveal threshold is now a cache hit: the raster is
+        // there the same frame, and the worker renders nothing new.
+        engine.overlays_for(Some(ms(600)));
+        assert!(!engine.current_overlays().is_empty());
+        assert_eq!(engine.raster_latencies().len(), worker_renders);
+    }
+
+    #[test]
+    fn resize_prunes_stale_rasters() {
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.submit(cue("resized", 0, 10_000));
+        engine.overlays_for(Some(ms(100)));
+        ready_overlay(&engine);
+        assert!(engine.cached_rasters() >= 1);
+
+        // The old-canvas raster can never be used again: gone immediately,
+        // and the cue re-rasters at the new size.
+        engine.set_canvas(1280, 720);
+        assert_eq!(engine.cached_rasters(), 0);
+        assert!(
+            wait_for(|| !engine.current_overlays().is_empty()),
+            "the active cue must re-raster at the new size"
+        );
+    }
+
+    #[test]
+    fn unpremultiply_matches_the_reference_formula() {
+        // The LUT must stay within 1 LSB of the exact rounded division for
+        // every (value, alpha) pair, and be exact on the fast paths.
+        for alpha in 0..=255u32 {
+            for value in 0..=255u32 {
+                let out = premul_to_straight_rgba(&[value as u8, 0, 0, alpha as u8]);
+                let expect = match alpha {
+                    0 => 0,
+                    a => ((value * 255 + a / 2) / a).min(255),
+                };
+                let got = out[0] as u32;
+                assert!(
+                    got.abs_diff(expect) <= 1,
+                    "v={value} a={alpha}: got {got}, want {expect}"
+                );
+                if alpha == 255 || alpha == 0 {
+                    assert_eq!(got, expect, "fast paths must be exact");
+                }
+                assert_eq!(out[3], alpha as u8);
+            }
+        }
     }
 
     #[test]
