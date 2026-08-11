@@ -12,6 +12,14 @@
 //! lines as cue text, and converts a small whitelist of inline tags to
 //! Pango markup. Output is `format=pango-markup`.
 //!
+//! One deliberate exception to that parity, because the C's behaviour is
+//! plainly broken: a cue's text ends at a line containing `-->`, not only at a
+//! blank line. The spec's block collector rewinds to such a line and starts the
+//! next block there; the C, whose only exit from its text state is the blank
+//! line, swallows it and *displays the timestamps* of a file whose blocks are
+//! not blank-line separated (WPT's `embedded_style_urls.vtt` is exactly that
+//! file). See [`Machine::feed`].
+//!
 //! Everything here is std-only and self-contained (no dependency on the SubRip
 //! module, even though the C shares helpers), so the module builds and tests
 //! independently of its siblings.
@@ -142,28 +150,46 @@ impl Machine {
                 }
             }
             St::CollectText => {
-                if !self.buf.is_empty() {
-                    self.buf.push('\n');
-                }
-                self.buf.push_str(line);
-                if line.is_empty() {
-                    let text = finalize_text(&self.buf);
-                    // A reversed time line (end before start) is accepted by the
-                    // guard above and leaves the C with an underflowed duration,
-                    // so `start_time += duration` lands it back on the parsed
-                    // end. Feed the guard that same value, and clamp only the
-                    // cue we hand out.
-                    let mut cue =
-                        Cue::new(self.cur_start, Some(self.cur_end.max(self.cur_start)), text);
-                    cue.settings = std::mem::take(&mut self.cur_settings);
-                    cue.id = self.cur_id.take();
-                    cues.push(cue);
-                    self.prev_end = self.cur_end; // element: start_time += duration
-                    self.buf.clear();
-                    self.state = St::SeekTiming;
+                if line.contains("-->") {
+                    // Spec: once a cue's timing line has been seen, a later
+                    // line holding `-->` ends the block — "collect a WebVTT
+                    // block" rewinds to it, so it is reprocessed as the first
+                    // line of the *next* block, where it starts a new cue.
+                    // The cue being collected keeps the text it has, and the
+                    // timing line never becomes subtitle text. This is the one
+                    // place we deliberately leave the C, which only ever exits
+                    // its state 2 on a blank line and so displays the
+                    // timestamps of a blank-line-less file as cue text (WPT
+                    // `embedded_style_urls.vtt` is exactly that file).
+                    self.finish_cue(cues);
+                    self.feed_seek(line);
+                } else {
+                    if !self.buf.is_empty() {
+                        self.buf.push('\n');
+                    }
+                    self.buf.push_str(line);
+                    if line.is_empty() {
+                        self.finish_cue(cues);
+                    }
                 }
             }
         }
+    }
+
+    /// Emit the cue whose text has accumulated in `buf` and go back to seeking.
+    fn finish_cue(&mut self, cues: &mut Vec<Cue>) {
+        let text = finalize_text(&self.buf);
+        // A reversed time line (end before start) is accepted by the guard in
+        // [`Machine::feed_seek`] and leaves the C with an underflowed duration,
+        // so `start_time += duration` lands it back on the parsed end. Feed the
+        // guard that same value, and clamp only the cue we hand out.
+        let mut cue = Cue::new(self.cur_start, Some(self.cur_end.max(self.cur_start)), text);
+        cue.settings = std::mem::take(&mut self.cur_settings);
+        cue.id = self.cur_id.take();
+        cues.push(cue);
+        self.prev_end = self.cur_end; // element: start_time += duration
+        self.buf.clear();
+        self.state = St::SeekTiming;
     }
 
     /// One line in the seeking state.
@@ -1303,6 +1329,168 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].text, "<b>One</b>");
         assert_eq!(p.stylesheet().unwrap().rules().len(), 1);
+    }
+
+    // ---- Block separation: the spec's `-->` resynchronisation -------------
+
+    /// The `NOTE` block of WPT `embedded_style_urls.vtt`, verbatim.
+    const WPT_URLS_NOTE: &str = "NOTE\n\
+        Background for Voice1 should apply.\n\
+        The other two backgrounds should not render because non-data URLs are not supported.";
+
+    /// Its `STYLE` block, verbatim: three rules, brace-on-its-own-line and
+    /// brace-on-the-selector-line, a `data:` URL holding `;` `,` `/` and `+`,
+    /// and a multi-declaration rule.
+    const WPT_URLS_STYLE: &str = "STYLE\n\
+        ::cue(v[voice=Voice1])\n\
+        {\n    \
+            background: url(data:image/gif;base64,R0lGODlhEAAQAMQAAORHHOVSKudfOulrSOp3WOyDZu6QdvCchPGolfO0o/XBs/fNwfjZ0frl3/zy7////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACH5BAkAABAALAAAAAAQABAAAAVVICSOZGlCQAosJ6mu7fiyZeKqNKToQGDsM8hBADgUXoGAiqhSvp5QAnQKGIgUhwFUYLCVDFCrKUE1lBavAViFIDlTImbKC5Gm2hB0SlBCBMQiB0UjIQA7)\n\
+        }\n\
+        ::cue(b)\n\
+        {\n    \
+            background: url(\"support/background.png\")\n\
+        }\n\
+        ::cue(i) {\n    \
+            background: url(\"support/background.png\");\n    \
+            background: -webkit-image-set(url(\"support/background.png\") 1x, url(\"support/background.png\") 2x);\n\
+        }";
+
+    const WPT_URLS_CUE1: &str = "00:00:00.000 --> 00:00:05.000\n\
+        <v Voice1>This <i>is</i> a <b>test</b> subtitle";
+    const WPT_URLS_CUE2: &str = "00:00:00.000 --> 00:00:05.000\n\
+        <v Voice2>Here <i>is</i> a <b>second</b> subtitle";
+
+    /// Both cues, whatever separates the blocks: two cues over the same
+    /// interval, tags intact, and — the bug this pins — no timing line
+    /// anywhere in the text.
+    fn assert_wpt_urls_cues(cues: &[Cue]) {
+        assert_eq!(cues.len(), 2, "expected exactly two cues, got {cues:?}");
+        for c in cues {
+            assert_eq!(c.start_ns, 0);
+            assert_eq!(c.end_ns, Some(5 * S));
+            assert!(
+                !c.text.contains("--&gt;") && !c.text.contains("-->"),
+                "a timing line leaked into the cue text: {:?}",
+                c.text
+            );
+            assert!(
+                !c.text.contains("00:00:00.000"),
+                "a timing line leaked into the cue text: {:?}",
+                c.text
+            );
+        }
+        assert_eq!(
+            cues[0].text,
+            "<v Voice1>This <i>is</i> a <b>test</b> subtitle</v>"
+        );
+        assert_eq!(
+            cues[1].text,
+            "<v Voice2>Here <i>is</i> a <b>second</b> subtitle</v>"
+        );
+    }
+
+    #[test]
+    fn wpt_embedded_style_urls_run_together() {
+        // The file exactly as WPT ships it: not one blank line in it, so every
+        // block is terminated by the `-->` line that follows it. The C runs
+        // the second timing line into the first cue's text; the spec's block
+        // collector rewinds to it instead.
+        let body = format!(
+            "WEBVTT\n{WPT_URLS_NOTE}\n{WPT_URLS_STYLE}\n{WPT_URLS_CUE1}\n{WPT_URLS_CUE2}\n"
+        );
+        let (cues, p) = parse_keeping_parser(&body);
+        assert_wpt_urls_cues(&cues);
+        // The CSS parses without disturbing the block structure. All three
+        // rules declare nothing but an image background, which we do not
+        // support, so the sheet comes out empty rather than partial.
+        assert!(p.stylesheet().is_none());
+    }
+
+    #[test]
+    fn wpt_embedded_style_urls_blank_line_separated() {
+        // The same file with the blocks separated the conventional way. Same
+        // two cues: the `-->` rule and the blank-line rule agree.
+        let body = format!(
+            "WEBVTT\n\n{WPT_URLS_NOTE}\n\n{WPT_URLS_STYLE}\n\n{WPT_URLS_CUE1}\n\n{WPT_URLS_CUE2}\n"
+        );
+        let (cues, p) = parse_keeping_parser(&body);
+        assert_wpt_urls_cues(&cues);
+        assert!(p.stylesheet().is_none());
+    }
+
+    #[test]
+    fn style_block_extent_survives_urls_and_braces() {
+        // Same STYLE block, with one supported declaration bolted onto its
+        // last rule: it is collected, which pins the block's extent — the
+        // braces and the `;`-bearing `data:` URL before it neither ended the
+        // block early nor swallowed the cues after it.
+        let style = format!("{WPT_URLS_STYLE}\n::cue(b) {{ color: lime }}");
+        let body = format!("WEBVTT\n{WPT_URLS_NOTE}\n{style}\n{WPT_URLS_CUE1}\n{WPT_URLS_CUE2}\n");
+        let (cues, p) = parse_keeping_parser(&body);
+        assert_wpt_urls_cues(&cues);
+        let sheet = p.stylesheet().expect("the last rule is applicable");
+        assert_eq!(sheet.rules().len(), 1);
+    }
+
+    #[test]
+    fn timing_line_ends_the_cue_being_collected() {
+        // Reduced form of the bug: no blank line between the cues.
+        let body =
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nOne\n00:00:03.000 --> 00:00:04.000\nTwo\n\n";
+        let cues = parse(body);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "One");
+        assert_eq!(cues[0].start_ns, S);
+        assert_eq!(cues[1].text, "Two");
+        assert_eq!(cues[1].start_ns, 3 * S);
+    }
+
+    #[test]
+    fn resynchronisation_keeps_the_identifier_rules() {
+        // Spec: the resynchronised timing line is line 1 of its own block, so
+        // its cue has no identifier — the line before it belongs to the text
+        // of the cue that just ended.
+        let body = "WEBVTT\n\nid1\n00:00:01.000 --> 00:00:02.000\nOne\nid2\n\
+                    00:00:03.000 --> 00:00:04.000\nTwo\n\n";
+        let cues = parse(body);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].id.as_deref(), Some("id1"));
+        assert_eq!(cues[0].text, "One\nid2");
+        assert_eq!(cues[1].id, None);
+        assert_eq!(cues[1].text, "Two");
+    }
+
+    #[test]
+    fn unparsable_arrow_line_ends_the_cue_and_eats_its_block() {
+        // Any `-->` line ends the cue, not just a well-formed timing line.
+        // The new block then fails cue creation, so its lines are dropped —
+        // the spec discards a block whose cue is null.
+        let body = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nOne\n\
+                    broken --> line\ndropped\n\n00:00:03.000 --> 00:00:04.000\nTwo\n\n";
+        let cues = parse(body);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "One");
+        assert_eq!(cues[1].text, "Two");
+    }
+
+    #[test]
+    fn back_to_back_timing_lines_leave_the_first_cue_empty() {
+        let body =
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n00:00:03.000 --> 00:00:04.000\nTwo\n\n";
+        let cues = parse(body);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].text, "");
+        assert_eq!(cues[0].start_ns, S);
+        assert_eq!(cues[1].text, "Two");
+    }
+
+    #[test]
+    fn multi_line_cue_text_is_still_joined() {
+        // The resynchronisation must not split ordinary multi-line text.
+        let body = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nOne\nTwo\nThree\n\n";
+        let cues = parse(body);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "One\nTwo\nThree");
     }
 
     // ---- Timestamp edge cases --------------------------------------------

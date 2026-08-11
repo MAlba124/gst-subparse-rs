@@ -246,6 +246,97 @@ fn subparse_default_output_ignores_style_blocks() {
     assert!(buffer.meta::<CueIrMeta>().is_none());
 }
 
+/// Push a WebVTT body through `rssubparse` and drain the buffers.
+fn run_vtt(body: &str, cue_ir: bool) -> Vec<gst::Buffer> {
+    init();
+
+    let mut h = gst_check::Harness::new("rssubparse");
+    if cue_ir {
+        h.element()
+            .unwrap()
+            .set_property_from_str("text-format", "cue-ir");
+    }
+    h.set_src_caps_str("application/x-subtitle-vtt");
+    h.push(gst::Buffer::from_slice(body.as_bytes().to_vec()))
+        .expect("push succeeded");
+    h.push_event(gst::event::Eos::new());
+
+    let mut buffers = Vec::new();
+    while let Some(buffer) = h.try_pull() {
+        buffers.push(buffer);
+    }
+    buffers
+}
+
+/// Both output modes on the WPT `embedded_style_urls.vtt` shape: exactly two
+/// cues over 0-5s, tags and voices intact, and no timing line as cue text.
+fn assert_style_urls_cues(body: &str) {
+    let pango = run_vtt(body, false);
+    assert_eq!(pango.len(), 2, "pango-markup mode: expected two cues");
+    assert_eq!(
+        text_of(&pango[0]),
+        "<v Voice1>This <i>is</i> a <b>test</b> subtitle</v>"
+    );
+    assert_eq!(
+        text_of(&pango[1]),
+        "<v Voice2>Here <i>is</i> a <b>second</b> subtitle</v>"
+    );
+
+    let ir_bufs = run_vtt(body, true);
+    assert_eq!(ir_bufs.len(), 2, "cue-ir mode: expected two cues");
+    for (buffer, voice, word) in [
+        (&ir_bufs[0], "Voice1", "test"),
+        (&ir_bufs[1], "Voice2", "second"),
+    ] {
+        assert_eq!(buffer.pts(), Some(gst::ClockTime::ZERO));
+        assert_eq!(
+            buffer.duration(),
+            Some(gst::ClockTime::from_nseconds(5 * S))
+        );
+
+        let meta = buffer.meta::<CueIrMeta>().expect("meta attached");
+        let ir = meta.ir();
+        assert_eq!(ir.lines.len(), 1, "one line per cue: {:?}", ir.lines);
+        let spans = &ir.lines[0].spans;
+        assert_eq!(spans.len(), 5);
+        for span in spans {
+            assert_eq!(span.voice.as_deref(), Some(voice));
+            assert!(
+                !span.text.contains("-->"),
+                "a timing line became cue text: {:?}",
+                span.text
+            );
+        }
+        assert_eq!(spans[1].text, "is");
+        assert_eq!(spans[1].style.font_style, Some(FontStyle::Italic));
+        assert_eq!(spans[3].text, word);
+        assert_eq!(spans[3].style.font_weight, Some(700));
+    }
+}
+
+#[test]
+fn subparse_wpt_embedded_style_urls_keeps_timing_lines_out_of_the_text() {
+    // WPT `embedded_style_urls.vtt` verbatim: a NOTE block, a STYLE block
+    // whose CSS spans braces and a `;`-bearing data: URL, then two cues — and
+    // not one blank line in the whole file. Every block is terminated by the
+    // `-->` line after it, which the spec's block collector rewinds to.
+    let raw = std::fs::read_to_string("tests/corpus/wptvtt/embedded_style_urls.vtt")
+        .expect("corpus file");
+    assert!(!raw.contains("\n\n"), "the WPT file has no blank lines");
+    assert_style_urls_cues(&raw);
+
+    // The same file with its blocks blank-line separated: same two cues.
+    let normalised = raw
+        .replace("\nNOTE\n", "\n\nNOTE\n")
+        .replace("\nSTYLE\n", "\n\nSTYLE\n")
+        .replace(
+            "\n00:00:00.000 --> 00:00:05.000\n",
+            "\n\n00:00:00.000 --> 00:00:05.000\n",
+        );
+    assert_eq!(normalised.matches("\n\n").count(), 4);
+    assert_style_urls_cues(&normalised);
+}
+
 /// One framed SSA dialogue row through `rsssaparse` (the container shape:
 /// `codec_data` in caps, one row per timed buffer). `init_section` is the
 /// codec_data payload.

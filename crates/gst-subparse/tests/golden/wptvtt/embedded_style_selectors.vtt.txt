@@ -1,6 +1,6 @@
 cue 0: 0.000 +5.000
-  pango: "<v Voice1>This <i>is</i> a <b>test</b> subtitle\n00:00:00.000 --&gt; 00:00:05.000\n<v Voice2>Here <i>is</i> a <b>second</b> subtitle</v></v>"
-  text: "This is a test subtitle\n00:00:00.000 --> 00:00:05.000\nHere is a second subtitle"
+  pango: "<v Voice1>This <i>is</i> a <b>test</b> subtitle</v>"
+  text: "This is a test subtitle"
   base: size=8.25pt bg=#00ff00
   line:
     span "This " voice="Voice1"
@@ -8,8 +8,10 @@ cue 0: 0.000 +5.000
     span " a " voice="Voice1"
     span "test" voice="Voice1" [weight=700 fg=#008000 bg=#008000]
     span " subtitle" voice="Voice1"
-  line:
-    span "00:00:00.000 --> 00:00:05.000" voice="Voice1"
+cue 1: 0.000 +5.000
+  pango: "<v Voice2>Here <i>is</i> a <b>second</b> subtitle</v>"
+  text: "Here is a second subtitle"
+  base: size=8.25pt bg=#00ff00
   line:
     span "Here " voice="Voice2"
     span "is" voice="Voice2" [style=italic fg=#008000 bg=#008000]

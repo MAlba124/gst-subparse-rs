@@ -39,7 +39,40 @@ extra empty line.
   is no signature validation and no `NOTE`-block handling. Those lines simply
   never contain `" --> "`.
 - **Collecting text** (C state 2): subsequent lines are appended (joined with
-  `\n`) until a blank line ends the cue and emits it.
+  `\n`) until a blank line ends the cue and emits it — **or** until a line
+  containing `-->` does, see below.
+
+#### Block separation: the one deliberate parity break
+
+The C leaves its text state only on a blank line. The W3C block collector
+(*collect a WebVTT block*) also ends the block at any line containing the
+substring `-->` once the block's own timing line has been seen: it rewinds to
+that line and starts the next block there. The two rules only differ for a file
+whose blocks are not separated by blank lines — and for such a file the C
+appends the *timing lines themselves* to the cue text, i.e. it renders
+`00:00:00.000 --> 00:00:05.000` as a subtitle. WPT's
+`embedded_style_urls.vtt`, `embedded_style_selectors.vtt` and
+`embedded_style_media_queries.vtt` are exactly that file (no blank line
+anywhere), and every browser shows two cues where the C shows one with the
+timestamps in it.
+
+So we follow the spec here: in the text state a line containing `-->` emits the
+cue with the text collected so far and is then re-run through the seeking
+state, exactly as if the collector had rewound to it. Consequences, all of them
+the spec's:
+
+- the resynchronised timing line is line 1 of its own block, so its cue has no
+  identifier, and the line before it belongs to the previous cue's text;
+- a `-->` line that does *not* parse as a timing line still ends the cue, and
+  the lines after it are then ignored until the next timing line — the spec
+  discards a block whose cue creation failed;
+- two timing lines in a row leave the first cue with empty text.
+
+Not modelled: the spec's *in header* flag, which suppresses `STYLE`/`REGION`
+recognition inside the one block that may directly follow the `WEBVTT`
+signature line. We recognise a `STYLE` block there too. That can only ever
+*add* styling to `cue-ir` output (the C ignores `STYLE` entirely and so does
+our pango-markup mode), never move a cue boundary.
 
 ### Timestamps (`parse_subrip_time`)
 

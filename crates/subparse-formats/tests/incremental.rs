@@ -100,6 +100,8 @@ fn fixtures() -> Vec<Fixture> {
                <b>Two</b> <font>dropped</font>\n\
                \n\
                00:00:05.000 --> 00:00:06.000\n\
+               No blank line before the next timing line\n\
+               00:00:07.000 --> 00:00:08.000\n\
                Trailing cue with no blank line",
     });
 
