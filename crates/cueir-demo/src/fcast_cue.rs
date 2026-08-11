@@ -448,9 +448,28 @@ enum RasterState {
     /// the completion signal repaints — the engine never waits.
     Pending,
     Ready(Arc<Raster>),
+    /// Like `Pending` for the worker (a replacement is wanted), but the
+    /// previous raster keeps showing meanwhile — its placement is still
+    /// valid, so a stale frame beats a blank one. Used when the same cue
+    /// re-keys in place: a karaoke step crossing before the prefetch landed,
+    /// or a style change. (A canvas/video-rect change stays `Pending`
+    /// instead: the old raster's placement is wrong in the new geometry.)
+    Stale(Arc<Raster>),
     /// The worker could not produce pixels (empty text, absurd size).
     /// Remembered so the cue is not re-requested every frame.
     Failed,
+}
+
+impl RasterState {
+    /// Re-key in place: keep the pixels on screen while the replacement
+    /// renders, if there are any; otherwise (nothing yet, or a failure under
+    /// the old key) start over as `Pending`.
+    fn into_stale(self) -> RasterState {
+        match self {
+            RasterState::Ready(raster) | RasterState::Stale(raster) => RasterState::Stale(raster),
+            _ => RasterState::Pending,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -687,10 +706,13 @@ impl CueEngine {
             let style = Arc::new(style);
             state.style = style.clone();
 
-            // The active cue's raster was drawn with the old style.
+            // The active cue's raster was drawn with the old style; keep
+            // showing it (its placement is still valid) until the re-styled
+            // one lands, rather than blinking blank on a settings toggle.
             if let Some(active) = state.active.as_mut() {
                 active.key.style = style.clone();
-                active.raster = RasterState::Pending;
+                let raster = std::mem::replace(&mut active.raster, RasterState::Pending);
+                active.raster = raster.into_stale();
             }
             self.shared
                 .cache
@@ -871,7 +893,7 @@ impl CueEngine {
                 return (None, false);
             };
             match active.raster {
-                RasterState::Pending => {
+                RasterState::Pending | RasterState::Stale(_) => {
                     if let Some(raster) = self.shared.cache.lock().get(&active.key) {
                         active.raster = RasterState::Ready(raster);
                         (None, true)
@@ -959,7 +981,7 @@ impl CueEngine {
 fn active_overlays(state: &State) -> SmallVec<[Overlay; 1]> {
     let mut overlays = SmallVec::new();
     if let Some(Active {
-        raster: RasterState::Ready(raster),
+        raster: RasterState::Ready(raster) | RasterState::Stale(raster),
         ..
     }) = state.active.as_ref()
     {
@@ -1043,16 +1065,21 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
     };
 
     // Karaoke: the raster is keyed on how many reveal steps the clock has
-    // passed; crossing one re-keys it (usually a cache hit after the first
-    // pass through the cue).
+    // passed; crossing one re-keys it (usually a cache hit thanks to the
+    // prefetch). If the replacement is not ready yet, the previous step
+    // keeps showing (`Stale`) — the whole line used to blink off for a
+    // frame at every syllable on the first pass.
     if let Some(active) = state.active.as_mut()
         && !active.steps.is_empty()
     {
         let step = active.steps.partition_point(|s| *s <= rt);
         if step != active.key.step {
             active.key.step = step;
-            active.raster = RasterState::Pending;
-            changed = true;
+            let raster = std::mem::replace(&mut active.raster, RasterState::Pending);
+            active.raster = raster.into_stale();
+            // What is on screen only changes if we stopped showing pixels;
+            // a Stale raster is the same image until the replacement lands.
+            changed |= !matches!(active.raster, RasterState::Stale(_));
         }
     }
 
@@ -1236,7 +1263,7 @@ fn publish(shared: &Arc<Shared>, key: RasterKey, raster: Option<Arc<Raster>>) ->
     let Some(active) = state.active.as_mut() else {
         return false;
     };
-    if active.key != key || !matches!(active.raster, RasterState::Pending) {
+    if active.key != key || !matches!(active.raster, RasterState::Pending | RasterState::Stale(_)) {
         return false;
     }
     active.raster = match raster {
@@ -2176,6 +2203,12 @@ mod tests {
         engine.overlays_for(Some(ms(100)));
         let before = ready_overlay(&engine);
         engine.overlays_for(Some(ms(600)));
+        // Whether the prefetch landed or the previous step is showing as
+        // Stale, the cue must never blink off at a step crossing.
+        assert!(
+            !engine.current_overlays().is_empty(),
+            "no blank frame at a karaoke step crossing"
+        );
         assert!(
             wait_for(|| {
                 engine
@@ -2234,6 +2267,12 @@ mod tests {
 
         // The paused path: no frame flows, the style change alone repaints.
         engine.set_style(CueStyle::boxed());
+        // Never blank during the transition: the old-style raster stays on
+        // screen (Stale) until the re-styled one lands.
+        assert!(
+            !engine.current_overlays().is_empty(),
+            "the previous raster must keep showing while the restyle renders"
+        );
         assert!(
             wait_for(|| {
                 engine
