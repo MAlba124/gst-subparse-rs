@@ -709,6 +709,10 @@ mod markup {
         layout: Layout,
         /// `{\anN}`: the first one wins, like the SSA renderers.
         an_set: bool,
+        /// Reveal time for spans emitted from here on: set by WebVTT inline
+        /// timestamps (`&lt;00:00:00.200&gt;` in the C's markup), absolute on
+        /// the cue's timeline.
+        reveal_ns: Option<u64>,
     }
 
     pub(super) fn parse(input: &str, sheet: Option<&Stylesheet>, cue_id: Option<&str>) -> CueIr {
@@ -759,6 +763,7 @@ mod markup {
             base,
             layout: Layout::default(),
             an_set: false,
+            reveal_ns: None,
         };
 
         let bytes = input.as_bytes();
@@ -785,12 +790,20 @@ mod markup {
                     }
                 },
                 b'&' if !raw => {
-                    let (ch, used) = decode_entity(&input[pos..]);
-                    match ch {
-                        Some(c) => p.push_char(c),
-                        None => p.push_char('&'),
+                    // A WebVTT inline timestamp (which the C keeps escaped in
+                    // its markup) becomes the reveal time of the spans after
+                    // it; everything else is an ordinary entity.
+                    if let Some((ns, used)) = parse_timestamp_ref(&input[pos..]) {
+                        p.timestamp(ns);
+                        pos += used;
+                    } else {
+                        let (ch, used) = decode_entity(&input[pos..]);
+                        match ch {
+                            Some(c) => p.push_char(c),
+                            None => p.push_char('&'),
+                        }
+                        pos += used;
                     }
-                    pos += used;
                 }
                 b'{' if raw => {
                     if bytes.get(pos + 1) != Some(&b'\\') {
@@ -847,6 +860,55 @@ mod markup {
         }
         let name = tag_name(body.trim_start_matches([' ', '\t']));
         matches!(name.as_str(), "i" | "b" | "u" | "s" | "font")
+    }
+
+    /// Try to read an escaped WebVTT inline timestamp `&lt;...&gt;` starting
+    /// at `input` (which begins with `&`). The C's markup keeps these tags
+    /// escaped (they start with a digit, so its unhandled-tag removal spares
+    /// them), which is exactly the form that reaches this parser. Returns
+    /// the timestamp and how many bytes the whole reference consumed.
+    fn parse_timestamp_ref(input: &str) -> Option<(u64, usize)> {
+        let rest = input.strip_prefix("&lt;")?;
+        let end = rest.find("&gt;")?;
+        // Timestamps are short; a distant "&gt;" means this is ordinary text.
+        if end > 24 {
+            return None;
+        }
+        let ns = parse_vtt_timestamp(&rest[..end])?;
+        Some((ns, 4 + end + 4))
+    }
+
+    /// A WebVTT timestamp `[HH:]MM:SS.mmm`, lenient like the rest of the VTT
+    /// path: `,` works as the separator too (the C passes the file's bytes
+    /// through) and the fraction may be shorter or longer than 3 digits. The
+    /// fraction is required — without one, digits around a colon are far
+    /// more likely to be prose (`<12:30>`) than a timestamp.
+    fn parse_vtt_timestamp(s: &str) -> Option<u64> {
+        fn dec(s: &str) -> Option<u64> {
+            (!s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| s.parse().unwrap())
+        }
+        let parts: Vec<&str> = s.split(':').collect();
+        let (h, m, sec_frac) = match parts.as_slice() {
+            [h, m, s] => (dec(h)?, dec(m)?, *s),
+            [m, s] => (0, dec(m)?, *s),
+            _ => return None,
+        };
+        let (sec, frac) = sec_frac.split_once(['.', ','])?;
+        let sec = dec(sec)?;
+        if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // Right-pad / truncate the fraction to nanoseconds.
+        let mut frac_ns = 0u64;
+        for i in 0..9 {
+            frac_ns = frac_ns * 10 + frac.as_bytes().get(i).map_or(0, |b| (b - b'0') as u64);
+        }
+        Some(
+            (h.saturating_mul(3600) + m * 60 + sec)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(frac_ns),
+        )
     }
 
     /// Decode one `&...;` reference starting at `input` (which begins with
@@ -910,6 +972,7 @@ mod markup {
                 && last.style == self.ctx.style
                 && last.voice == self.ctx.voice
                 && last.classes == self.ctx.classes
+                && last.reveal_ns == self.reveal_ns
                 && last.ruby.is_none()
             {
                 last.text.push_str(&text);
@@ -921,8 +984,14 @@ mod markup {
                 voice: self.ctx.voice.clone(),
                 classes: self.ctx.classes.clone(),
                 ruby: None,
-                reveal_ns: None,
+                reveal_ns: self.reveal_ns,
             });
+        }
+
+        /// A WebVTT inline timestamp: the text after it reveals at `ns`.
+        fn timestamp(&mut self, ns: u64) {
+            self.flush();
+            self.reveal_ns = Some(ns);
         }
 
         fn end_line(&mut self) {
@@ -1723,6 +1792,68 @@ mod tests {
         );
         // Unclosed block stays literal.
         assert_eq!(CueIr::from_srt_text("a {\\an8").plain_text(), "a {\\an8");
+    }
+
+    // ---- webvtt inline timestamps (karaoke) ---------------------------------
+
+    #[test]
+    fn inline_timestamps_become_reveal_times() {
+        // What the C's VTT markup carries for karaoke cues.
+        let ir = CueIr::from_pango_markup(
+            "One... &lt;00:00:00,200&gt;Two... &lt;00:00:00,500&gt;Three...",
+        );
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, "One... ");
+        assert_eq!(spans[0].reveal_ns, None);
+        assert_eq!(spans[1].text, "Two... ");
+        assert_eq!(spans[1].reveal_ns, Some(200_000_000));
+        assert_eq!(spans[2].text, "Three...");
+        assert_eq!(spans[2].reveal_ns, Some(500_000_000));
+        // The timestamps are markers, not text.
+        assert_eq!(ir.plain_text(), "One... Two... Three...");
+    }
+
+    #[test]
+    fn inline_timestamp_variants() {
+        // Dot separator, hour component, hour-less form, short fraction.
+        let ir = CueIr::from_pango_markup("&lt;01:02:03.004&gt;x");
+        assert_eq!(
+            spans_of(&ir)[0].reveal_ns,
+            Some((3600 + 2 * 60 + 3) * 1_000_000_000 + 4_000_000)
+        );
+        let ir = CueIr::from_pango_markup("&lt;00:01.5&gt;x");
+        assert_eq!(spans_of(&ir)[0].reveal_ns, Some(1_500_000_000));
+    }
+
+    #[test]
+    fn inline_timestamps_keep_the_surrounding_styling() {
+        let ir = CueIr::from_pango_markup("<c.yellow>la&lt;00:00:01.000&gt;la</c>");
+        let spans = spans_of(&ir);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].reveal_ns, None);
+        assert_eq!(spans[1].reveal_ns, Some(1_000_000_000));
+        for s in spans {
+            assert_eq!(s.style.foreground, Some(Color::rgb(255, 255, 0)));
+            assert_eq!(s.classes, vec!["yellow"]);
+        }
+    }
+
+    #[test]
+    fn non_timestamps_stay_literal_text() {
+        // No fraction (prose like "<12:30>"), no colon, junk: all literal.
+        assert_eq!(
+            CueIr::from_pango_markup("see you &lt;12:30&gt;").plain_text(),
+            "see you <12:30>"
+        );
+        assert_eq!(
+            CueIr::from_pango_markup("&lt;123&gt;").plain_text(),
+            "<123>"
+        );
+        assert_eq!(
+            CueIr::from_pango_markup("a &lt; b &gt; c").plain_text(),
+            "a < b > c"
+        );
     }
 
     #[test]

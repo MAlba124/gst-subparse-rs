@@ -32,7 +32,9 @@ blocks are parsed (`::cue` selectors with classes, voices, ids, `:lang`;
 colors, fonts, text-shadow, outline, ruby-position — see
 `subparse_formats::vttcss`) and applied to the IR with CSS cascade semantics,
 and both the archaic (`T:`/`A:`/...) and modern (`align:center
-position:50%`) cue-settings syntaxes fold into the IR's layout.
+position:50%`) cue-settings syntaxes fold into the IR's layout. Inline
+timestamps (`<00:00:00.200>`, shown literally by the C) become per-span
+karaoke reveal times.
 
 For SSA/ASS, cue-ir mode reads the `[V4(+) Styles]` definitions (from the
 file or from a container's `codec_data`) and the `{\...}` override tags the C

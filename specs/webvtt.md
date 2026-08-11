@@ -176,6 +176,16 @@ Applied in order to the accumulated cue text:
    rescans to the end of the buffer per `&lt;`. We scan once with a forward-only
    cursor instead, since a cue's length is bounded by nothing (see
    `tests/tag_scan_linearity.rs`).
+
+   The pango output therefore *displays* inline timestamps as literal text.
+   In cue-ir mode the IR builder recognises the escaped form instead and
+   turns it into karaoke timing: the timestamp disappears from the text and
+   the spans after it carry `Span::reveal_ns` (absolute, the same media
+   timeline the cue's own timing uses — the WPT `*_with_timestamp*` goldens
+   pin this). Lenient like the rest of this path: `.` or `,` as the
+   fraction separator, optional hours, short/long fractions; digits around
+   a colon *without* a fraction (`<12:30>`) are treated as prose and stay
+   literal.
 4. `strip_trailing_newlines`, drop trailing `\n` (keeping ≥ 1 char).
 5. `subrip_fix_up_markup`, balance tags by adding missing closing tags at the
    end and dropping closing tags that were never opened (name match here is ASCII
