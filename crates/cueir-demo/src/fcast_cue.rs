@@ -61,7 +61,12 @@
 //!    });
 //!    ```
 //!
-//! 4. The first-use warm-up lesson still applies (ASSERTION-LANDMINES §6):
+//! 4. Feed [`CueEngine::set_video_rect`] wherever the sink recomputes the
+//!    scaled destination rect (resize/rotation/aspect change), alongside the
+//!    `set_canvas` call it already makes. It anchors positioned cues to the
+//!    picture and sizes text against the picture height; without it the
+//!    window doubles as the frame, which is what the pango version did.
+//! 5. The first-use warm-up lesson still applies (ASSERTION-LANDMINES §6):
 //!    call [`CueEngine::warm`] at sink construction. Parley's font
 //!    enumeration is far cheaper than fontconfig's, but it is not free and
 //!    it must not run on a streaming thread.
@@ -106,6 +111,20 @@ const RASTER_CACHE_LIMIT: usize = 16;
 /// Refuse to allocate a raster larger than this in either dimension.
 const MAX_RASTER_PX: i32 = 8192;
 
+/// The rectangle the video actually occupies inside the window (after
+/// aspect-ratio scaling), in window coordinates. The sink computes this for
+/// rendering anyway; feeding it to [`CueEngine::set_video_rect`] is what
+/// anchors positioned cues (SSA `\pos`, WebVTT `line:`/`position:`) to the
+/// *picture* rather than the window, and sizes text against the picture
+/// height. Without it, the whole window doubles as the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 // -- house style ----------------------------------------------------------------
 
 /// Straight-alpha RGBA, toolkit-agnostic.
@@ -134,6 +153,12 @@ pub struct CueStyle {
     pub wrap_width_fraction: f32,
     /// Distance from the bottom edge, as a fraction of canvas height.
     pub bottom_margin_fraction: f32,
+    /// Whether *default-placed* subtitles (no positioning in the file) may
+    /// sit in the window's letterbox bars instead of covering the picture
+    /// (mpv's `sub-use-margins`, and what the pango version effectively
+    /// did). Cues the file positions explicitly always track the video
+    /// rectangle regardless.
+    pub use_window_margins: bool,
     /// Stroked border behind the glyphs; `None` = no outline.
     pub outline: Option<OutlineStyle>,
     /// Box painted behind the whole cue; `None` = no box. When the subtitle
@@ -182,6 +207,7 @@ impl Default for CueStyle {
             min_font_px: 12.0,
             wrap_width_fraction: 0.90,
             bottom_margin_fraction: 0.04,
+            use_window_margins: true,
             outline: Some(OutlineStyle {
                 color: [0, 0, 0, 217],
                 width_fraction: 0.14,
@@ -385,6 +411,7 @@ struct RasterKey {
     ir: Arc<CueIr>,
     style: Arc<CueStyle>,
     canvas: (u32, u32),
+    video_rect: Option<VideoRect>,
     /// Number of reveal thresholds at or before the frame clock (0 = only
     /// the un-timed spans are visible). Always 0 for non-karaoke cues.
     step: usize,
@@ -393,6 +420,7 @@ struct RasterKey {
 impl PartialEq for RasterKey {
     fn eq(&self, other: &Self) -> bool {
         self.canvas == other.canvas
+            && self.video_rect == other.video_rect
             && self.step == other.step
             && (Arc::ptr_eq(&self.ir, &other.ir) || self.ir == other.ir)
             && (Arc::ptr_eq(&self.style, &other.style) || self.style == other.style)
@@ -427,6 +455,8 @@ struct State {
     active: Option<Active>,
     /// Display size the rasters are laid out against.
     canvas: (u32, u32),
+    /// Where the video sits inside that display (see [`VideoRect`]).
+    video_rect: Option<VideoRect>,
     /// The house style rasters are drawn with (see [`CueStyle`]).
     style: Arc<CueStyle>,
     /// The video segment as captured by the sink, for pts → running time.
@@ -575,6 +605,47 @@ impl CueEngine {
     /// turned into the running time cues are scheduled in.
     pub fn set_video_segment(&self, segment: &gst::Segment) {
         self.shared.state.lock().video_segment = Some(segment.clone());
+    }
+
+    /// Set the rectangle the video occupies inside the window, in window
+    /// coordinates (`None` = unknown; the whole window then doubles as the
+    /// frame). Update it wherever the sink recomputes its scaled destination
+    /// rect — resize, rotation, aspect change. Positioned cues track it;
+    /// default-placed subtitles may still use the window bars (see
+    /// [`CueStyle::use_window_margins`]).
+    pub fn set_video_rect(&self, rect: Option<VideoRect>) {
+        if let Some(r) = rect
+            && (r.width == 0 || r.height == 0)
+        {
+            debug!(?rect, "ignoring zero-sized video rect");
+            return;
+        }
+
+        let changed;
+        let fetch;
+        {
+            let mut state = self.shared.state.lock();
+            if state.video_rect == rect {
+                return;
+            }
+            state.video_rect = rect;
+
+            // The active cue's raster was laid out against the old frame.
+            if let Some(active) = state.active.as_mut() {
+                active.key.video_rect = rect;
+                active.raster = RasterState::Pending;
+            }
+            let (want, filled) = self.resolve_raster(&mut state);
+            fetch = want;
+            changed = filled;
+        }
+
+        if let Some(request) = fetch {
+            self.request_raster(request);
+        }
+        if changed {
+            self.mark_changed();
+        }
     }
 
     /// Change the house style (see [`CueStyle`]); the active cue re-rasters.
@@ -855,6 +926,7 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
     }
 
     let canvas = state.canvas;
+    let video_rect = state.video_rect;
     let mut changed = match candidate {
         Some(cue) => {
             if state.active.as_ref().is_some_and(|act| act.cue == cue) {
@@ -866,6 +938,7 @@ fn evaluate(state: &mut State, rt: gst::ClockTime) -> bool {
                         ir: cue.content.ir.clone(),
                         style: state.style.clone(),
                         canvas,
+                        video_rect,
                         step: 0,
                     },
                     steps,
@@ -1099,6 +1172,7 @@ impl RasterCtx {
             ir: Arc::new(CueIr::from_plain_text("Warming the font stack")),
             style: Arc::new(CueStyle::default()),
             canvas: (640, 360),
+            video_rect: None,
             step: 0,
         };
         if self.render(&request).is_none() {
@@ -1114,15 +1188,34 @@ impl RasterCtx {
             return None;
         }
         let (cw, ch) = (canvas_w as f32, canvas_h as f32);
+        // The *frame*: where the picture sits in the window. Everything the
+        // subtitle file expresses (positions, margins, SSA font sizes) is
+        // relative to it; without a known rect the window doubles as it.
+        let frame = match request.video_rect {
+            Some(r) => Frame {
+                x: r.x as f32,
+                y: r.y as f32,
+                w: r.width as f32,
+                h: r.height as f32,
+            },
+            None => Frame {
+                x: 0.0,
+                y: 0.0,
+                w: cw,
+                h: ch,
+            },
+        };
 
-        let base_px = (ch * house.font_height_fraction).max(house.min_font_px);
+        // Text scales with the picture, not the window: a pillarboxed video
+        // should not get subtitles sized for the full screen.
+        let base_px = (frame.h * house.font_height_fraction).max(house.min_font_px);
         // Cue box width from the IR's `size` (WebVTT), else the house wrap.
         let size_pct = ir
             .layout
             .size
             .unwrap_or(house.wrap_width_fraction * 100.0)
             .clamp(1.0, 100.0);
-        let wrap_px = (cw * size_pct / 100.0).max(1.0);
+        let wrap_px = (frame.w * size_pct / 100.0).max(1.0);
 
         // Which reveal ranks are visible at this step (see `reveal_rank`).
         let mut step_ns: Vec<u64> = ir
@@ -1180,7 +1273,7 @@ impl RasterCtx {
         b.push_default(StyleProperty::FontSize(font_px(
             base.font_size,
             base_px,
-            ch,
+            frame.h,
         )));
         match (base.font_family.as_deref(), house.font_family.as_deref()) {
             (Some(family), _) | (None, Some(family)) => {
@@ -1241,7 +1334,7 @@ impl RasterCtx {
             }
             if s.font_size.is_some() {
                 b.push(
-                    StyleProperty::FontSize(font_px(s.font_size, base_px, ch)),
+                    StyleProperty::FontSize(font_px(s.font_size, base_px, frame.h)),
                     range.clone(),
                 );
             }
@@ -1417,7 +1510,14 @@ impl RasterCtx {
         rc.render_to_pixmap(&mut pixmap);
         let pixels = premul_to_straight_rgba(pixmap.data_as_u8_slice());
 
-        let (x, y) = place(ir, house, cw, ch, surface_w as f32, surface_h as f32, pad);
+        let (x, y) = place(
+            ir,
+            house,
+            (cw, ch),
+            frame,
+            surface_w as f32,
+            surface_h as f32,
+        );
         Some(Raster {
             pixels,
             width: surface_w as u32,
@@ -1495,44 +1595,84 @@ fn draw_decoration(
     ));
 }
 
-/// Place the finished raster on the canvas: an explicit SSA origin (`\pos`)
-/// pins the anchor point exactly; otherwise WebVTT `position`/`line`
-/// percentages apply; otherwise the anchor's own frame region with the IR (or
-/// house) margins; the default is the customary bottom-center strip.
-fn place(ir: &CueIr, house: &CueStyle, cw: f32, ch: f32, w: f32, h: f32, pad: f32) -> (i32, i32) {
+/// The rectangle the file's coordinates are relative to (the video rect, or
+/// the whole window when it is unknown), in window coordinates.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+/// Place the finished raster, in window coordinates.
+///
+/// Everything the subtitle file expresses is resolved inside the *frame*
+/// (the picture): an explicit SSA origin (`\pos`) pins the anchor point
+/// exactly, then WebVTT `position`/`line` percentages, then the anchor's own
+/// frame region with the IR margins. A cue the file says nothing about is
+/// house policy: bottom-center of the frame — or of the *window* when
+/// [`CueStyle::use_window_margins`] is set, letting default subtitles sit in
+/// the letterbox bars instead of covering the picture (the margin itself
+/// stays proportional to the picture so the look does not change with the
+/// bars).
+fn place(
+    ir: &CueIr,
+    house: &CueStyle,
+    (cw, ch): (f32, f32),
+    frame: Frame,
+    w: f32,
+    h: f32,
+) -> (i32, i32) {
     let anchor = ir.layout.anchor.unwrap_or(ir::Anchor::BottomCenter);
     let (col, row) = anchor_cell(anchor);
-    // `pad` sits symmetrically around the ink, so anchoring the padded box
-    // is anchoring the ink to within a pixel; not worth compensating.
-    let _ = pad;
+    let l = &ir.layout;
+    // "The file said nothing": no explicit placement of any kind. Note the
+    // anchor alone (SSA alignment, {\an8}) keeps frame placement — a
+    // top-anchored cue belongs over the picture's top, not the window's.
+    let positioned = l.origin.is_some()
+        || l.position.is_some()
+        || l.line.is_some()
+        || l.margins.is_some()
+        || l.anchor.is_some();
+    let window_margins = house.use_window_margins && !positioned;
 
-    let x = if let Some((ox, _)) = ir.layout.origin {
-        cw * ox / 100.0 - w * col
-    } else if let Some(p) = ir.layout.position {
-        cw * p / 100.0 - w / 2.0
+    let x = if let Some((ox, _)) = l.origin {
+        frame.x + frame.w * ox / 100.0 - w * col
+    } else if let Some(p) = l.position {
+        frame.x + frame.w * p / 100.0 - w / 2.0
     } else {
-        (cw - w) / 2.0
+        // Centered on the picture (which is centered in the window anyway).
+        frame.x + (frame.w - w) / 2.0
     };
-    let y = if let Some((_, oy)) = ir.layout.origin {
-        ch * oy / 100.0 - h * row
-    } else if let Some(ir::LinePosition::Percent(p)) = ir.layout.line {
-        ch * p / 100.0
+    let y = if let Some((_, oy)) = l.origin {
+        frame.y + frame.h * oy / 100.0 - h * row
+    } else if let Some(ir::LinePosition::Percent(p)) = l.line {
+        frame.y + frame.h * p / 100.0
     } else {
-        let mv = ir
-            .layout
+        // Margin proportional to the picture, applied to the frame or —
+        // for unpositioned cues under the window-margins policy — to the
+        // window, whose bottom bar it may then use.
+        let mv = l
             .margins
             .map(|m| m.vertical)
             .filter(|v| *v > 0.0)
             .map(|v| v / 100.0)
             .unwrap_or(house.bottom_margin_fraction)
-            * ch;
+            * frame.h;
+        let (top, bottom) = if window_margins {
+            (mv, ch - mv - h)
+        } else {
+            (frame.y + mv, frame.y + frame.h - mv - h)
+        };
         match anchor_row(anchor) {
-            AnchorRow::Top => mv,
-            AnchorRow::Center => (ch - h) / 2.0,
-            AnchorRow::Bottom => ch - mv - h,
+            AnchorRow::Top => top,
+            AnchorRow::Center => frame.y + (frame.h - h) / 2.0,
+            AnchorRow::Bottom => bottom,
         }
     };
 
+    // Whatever was asked for, the raster must land inside the window.
     (
         (x.clamp(0.0, (cw - w).max(0.0))) as i32,
         (y.clamp(0.0, (ch - h).max(0.0))) as i32,
@@ -1884,6 +2024,76 @@ mod tests {
                     .is_some_and(|after| after.pixels != before.pixels)
             }),
             "a style change must re-raster the active cue"
+        );
+    }
+
+    #[test]
+    fn positioned_cues_track_the_video_rect() {
+        // A 2x-letterboxed-and-pillarboxed picture inside a 640x360 window.
+        let rect = VideoRect {
+            x: 160,
+            y: 90,
+            width: 320,
+            height: 180,
+        };
+        let mut ir = CueIr::from_plain_text("sign");
+        ir.layout.origin = Some((50.0, 50.0)); // SSA \pos at picture center
+
+        let engine = CueEngine::new();
+        engine.set_canvas(640, 360);
+        engine.set_video_rect(Some(rect));
+        engine.submit(CueInput {
+            content: CueContent::ir(ir),
+            start_rt: ms(0),
+            end_rt: None,
+            pts_start: None,
+        });
+        engine.overlays_for(Some(ms(100)));
+
+        let overlay = ready_overlay(&engine);
+        // Default anchor is bottom-center: the anchor point sits at the
+        // *picture's* center (320, 180 in window coords), not the window's.
+        let anchor_x = overlay.x + overlay.width as i32 / 2;
+        let anchor_y = overlay.y + overlay.height as i32;
+        assert!(
+            (anchor_x - 320).abs() <= 2 && (anchor_y - 180).abs() <= 2,
+            "expected the \\pos anchor at the picture center (320,180), \
+             got ({anchor_x},{anchor_y})"
+        );
+    }
+
+    #[test]
+    fn default_cues_may_use_the_window_bars() {
+        // Letterboxed: 45px bars above and below the picture.
+        let rect = VideoRect {
+            x: 0,
+            y: 45,
+            width: 640,
+            height: 270,
+        };
+        let submit_and_bottom = |style: CueStyle| -> i32 {
+            let engine = CueEngine::new();
+            engine.set_canvas(640, 360);
+            engine.set_video_rect(Some(rect));
+            engine.set_style(style);
+            engine.submit(cue("plain subtitle", 0, 5_000));
+            engine.overlays_for(Some(ms(100)));
+            let overlay = ready_overlay(&engine);
+            overlay.y + overlay.height as i32
+        };
+
+        // Default policy (use_window_margins): the cue sits in the bottom
+        // bar, below the picture's bottom edge at y=315.
+        assert!(
+            submit_and_bottom(CueStyle::default()) > 315,
+            "window-margins policy must use the letterbox bar"
+        );
+        // Opting out keeps it over the picture.
+        let mut over_video = CueStyle::default();
+        over_video.use_window_margins = false;
+        assert!(
+            submit_and_bottom(over_video) <= 315,
+            "without window margins the cue must stay on the picture"
         );
     }
 
