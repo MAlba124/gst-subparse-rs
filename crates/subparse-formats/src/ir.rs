@@ -104,8 +104,9 @@ impl Color {
 }
 
 /// The CSS3 / X11 named colors (the set `pango_color_parse` accepts, matched
-/// ASCII case-insensitively), sorted by name for binary search.
-const NAMED_COLORS: &[(&str, u32)] = &[
+/// ASCII case-insensitively), sorted by name for binary search. Public so the
+/// `pango-markup` crate shares the table instead of duplicating it.
+pub const NAMED_COLORS: &[(&str, u32)] = &[
     ("aliceblue", 0xf0f8ff),
     ("antiquewhite", 0xfaebd7),
     ("aqua", 0x00ffff),

@@ -37,6 +37,11 @@ mod typefind;
 // IR types without adding (and version-matching) its own `subparse-formats`
 // dependency.
 pub use subparse_formats;
+// Re-exported for the same reason: a renderer receiving buffers that are
+// `text/x-raw, format=pango-markup` from elements outside this plugin
+// (matroskademux, the C ssaparse, ...) turns them into a CueIr with
+// `pango_markup::markup_to_cue_ir` instead of linking pango.
+pub use pango_markup;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     subparse::register(plugin)?;

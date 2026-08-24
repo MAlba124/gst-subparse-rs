@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/subparse-formats", "crates/gst-subparse"]
+members = ["crates/subparse-formats", "crates/pango-markup", "crates/gst-subparse"]
 
 [workspace.package]
 version = "0.1.0"

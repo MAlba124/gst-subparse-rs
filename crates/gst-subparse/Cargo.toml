@@ -11,6 +11,7 @@ authors.workspace = true
 gst = { package = "gstreamer", version = "0.25" }
 gst-base = { package = "gstreamer-base", version = "0.25" }
 subparse-formats = { path = "../subparse-formats", default-features = false }
+pango-markup = { path = "../pango-markup" }
 # Broad charset decoding for the non-UTF-8 paths (BOM-detected encodings, the
 # `encoding` property / GST_SUBTITLE_ENCODING, and the post-UTF-8-latch
 # fallback), mirroring the iconv-based conversion in the upstream C plugin. The

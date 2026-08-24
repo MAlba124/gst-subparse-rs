@@ -247,6 +247,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-base",
  "gstreamer-check",
+ "pango-markup",
  "subparse-formats",
 ]
 
@@ -479,6 +480,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aca39cf52b03268400c16eeb9b56382ea3c3353409309b63f5c8f0b1faf42754"
 dependencies = [
  "pastey",
+]
+
+[[package]]
+name = "pango-markup"
+version = "0.1.0"
+dependencies = [
+ "subparse-formats",
 ]
 
 [[package]]

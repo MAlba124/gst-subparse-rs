@@ -15,6 +15,9 @@ libfuzzer-sys = "0.4"
 path = "../crates/subparse-formats"
 default-features = false
 
+[dependencies.pango-markup]
+path = "../crates/pango-markup"
+
 # Per-format features forward to the matching `subparse-formats` feature, so a
 # per-format fuzz target can be built against only its format. `default` enables
 # all of them (so `cargo fuzz build` with no extra flags builds every target).
@@ -163,6 +166,13 @@ bench = false
 [[bin]]
 name = "typefind"
 path = "fuzz_targets/typefind.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pango_markup"
+path = "fuzz_targets/pango_markup.rs"
 test = false
 doc = false
 bench = false

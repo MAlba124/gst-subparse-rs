@@ -1,0 +1,18 @@
+[package]
+name = "pango-markup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Dependency-free Pango markup parser (pango_parse_markup reimplementation, no pango linkage)"
+
+[lib]
+name = "pango_markup"
+
+# Only in-workspace crates. The parser itself is std only; subparse-formats
+# (itself dependency-free) provides the CueIr types the `ir` module maps into.
+[dependencies]
+subparse-formats = { path = "../subparse-formats", default-features = false }
+
+[dev-dependencies]
